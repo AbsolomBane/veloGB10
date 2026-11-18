@@ -416,6 +416,7 @@ impl FwdModel {
         if !(pfx1_on(PFX1_HEADKV) && head_fill_on() && pfx1_headkv_poison()) { return Ok(()); }
         let Some(head) = self.mtp.as_ref() else { return Ok(()) };
         if q >= self.max_pos { return Ok(()); }
+        if self.vmm_lazy() { return Ok(()); } // KVPOOL: the gate writes rows [q, max_pos) — most are not mapped
         let (nkv, hd) = (self.cfg.num_kv_heads, self.cfg.head_dim);
         let rb = kv_rowbytes(self.kv_fmt, hd);
         let base = *head.kv.device_ptr() as u64;
