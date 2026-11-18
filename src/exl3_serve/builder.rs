@@ -819,7 +819,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
         tp: tp_rank.map(|r| TpSync::new(r, tp_world as i32)),
-        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), mrope_section, vis_seam: None, kv_pf: None, turn: turn_arm,
+        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), pf_done: Default::default(), pf_jobs: Vec::new(), vmm_wait: None, mrope_section, vis_seam: None, kv_pf: None, turn: turn_arm,
     };
     if width > 1 && spec_live {
         crate::dprintln!("[exl3-serve] serial lane order (--lane-order): {}{}", lane_order.name(),

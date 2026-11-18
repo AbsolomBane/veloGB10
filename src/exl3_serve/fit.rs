@@ -16,11 +16,19 @@ pub struct FitParts {
 /// What a configuration needs and whether it fits: Ok(table_in_ram_possible) or Err(the refusal text).
 pub fn fit_plan(p: FitParts, lanes: usize, avail: u64, mode: &str, max_pos: usize) -> Result<bool, String> {
     let gb = |b: u64| b as f64 / 1e9;
-    let base = p.weights + p.fixed + p.per_lane * lanes as u64 + p.floor;
+    // KVPOOL (fork): with a lazy shared pool of a set size the lanes cost the POOL, not lanes x a full window
+    // (+ ~0.3 GB a lane: its floor rows and the pages that straddle segment edges). Unset = the stock plan.
+    let pool = match (crate::kv_vmm::mode_from_opts(), crate::kv_vmm::pool_bytes_from_opts()) {
+        (Some(crate::kv_vmm::Mode::Lazy), Some(b)) => Some(b as u64 + 300_000_000 * lanes as u64),
+        _ => None,
+    };
+    let lanes_bytes = pool.unwrap_or(p.per_lane * lanes as u64);
+    let base = p.weights + p.fixed + lanes_bytes + p.floor;
     let with_table = base + p.table;
-    let line = format!("model weights {:.1} GB + {lanes} lane(s) x {:.2} GB (KV for {max_pos} tokens) + {:.1} GB working memory \
+    let line = format!("model weights {:.1} GB + {lanes} lane(s) x {:.2} GB (KV for {max_pos} tokens{}) + {:.1} GB working memory \
                         + {:.1} GB safety floor{} = {:.1} GB; this machine has {:.1} GB available",
-                       gb(p.weights), gb(p.per_lane), gb(p.fixed), gb(p.floor),
+                       gb(p.weights), gb(lanes_bytes / lanes.max(1) as u64),
+                       if pool.is_some() { "; shared KV pool" } else { "" }, gb(p.fixed), gb(p.floor),
                        if mode == "ram" { format!(" + n-gram table {:.1} GB in RAM", gb(p.table)) } else { String::new() },
                        gb(if mode == "ram" { with_table } else { base }), gb(avail));
     let fits_ssd = base <= avail;

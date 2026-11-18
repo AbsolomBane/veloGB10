@@ -227,6 +227,21 @@ impl Exl3Scheduler {
             // WP02: the client left mid-prefill — the slot is free again, nobody to tell
             Ok(false) => return,
             Err(e) => {
+                // KVPOOL: the pool is full and no idle lane could give way, but other lanes still decode. The prompt's rows
+                // are mapped before any restore or prefill write (prefill_plan / prefill_range), so nothing of this request
+                // ran yet: it waits at the head of the queue and is admitted again after the next decode round.
+                if crate::kv_vmm::is_exhausted(&e) && self.tp.is_none() && req.image_spans.is_empty()
+                    && self.lanes.iter().any(|l| l.is_some()) {
+                    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // one line per 10 s
+                    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let now_s = T0.get_or_init(std::time::Instant::now).elapsed().as_secs();
+                    if now_s >= SAID.load(std::sync::atomic::Ordering::Relaxed) {
+                        SAID.store(now_s + 10, std::sync::atomic::Ordering::Relaxed);
+                        crate::drprintln!("[kv-vmm] the shared KV pool is full; a {}-token request waits for a running lane to finish", req.prompt.len());
+                    }
+                    self.vmm_wait = Some(req);
+                    return;
+                }
                 crate::reprintln!("[exl3-serve] prefill failed (slot {free}): {e:#}");
                 let _ = req.tx.send(TokEvent::Finish { reason: format!("error: prefill failed: {e}") });
                 if self.tp.is_some() || sticky_cuda_error(&e) { self.fatal = Some(format!("{e:#}")); }

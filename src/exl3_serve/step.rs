@@ -102,6 +102,32 @@ impl Exl3Scheduler {
                                                         cache.as_ref().map(|c| c.len()))));
     }
 
+    /// KVPOOL: map lane `s` up to position `p`, evicting idle lanes while the pool is full. Ok(true) = the lane
+    /// is mapped for this round; Ok(false) = the pool could not grow it and no idle lane was left to free, so
+    /// the request on it ENDS here (finish=length) and the lane leaves the round — the other lanes still
+    /// decode, and `step_rounds` keeps the one early return its touch pin allows. Errors go to the caller's `?`.
+    fn vmm_room_or_end(&mut self, s: usize, p: usize, keep: &[usize]) -> Result<bool> {
+        loop {
+            match self.model.vmm_ensure(s, p) {
+                Ok(()) => return Ok(true),
+                Err(e) if crate::kv_vmm::is_exhausted(&e) => {
+                    if self.vmm_evict_idle(keep)? { continue; }
+                    // Nothing idle left to free: this lane cannot grow. End IT ("length": out of context
+                    // memory) and it leaves this round; the other lanes still decode this step.
+                    crate::dreprintln!("[kv-vmm] slot {s}: the shared KV pool is full and no idle lane can be evicted — \
+                                        request ended at position {p} (finish=length)");
+                    if let Some(lane) = self.take_lane(s, true) {
+                        lane.log_stats(s, "length");
+                        let _ = lane.tx.send(TokEvent::Finish { reason: "length".into() });
+                    }
+                    self.publish_kv();
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// The rounds of one `step` (every arm may return early; `step` does the per-step publication).
     fn step_rounds(&mut self) -> Result<()> {
         crate::metrics::sched_step(); // v0.7.3 gauge: rounds + busy
@@ -127,10 +153,29 @@ impl Exl3Scheduler {
                 }
             }
         }
-        let slots: Vec<usize> = self.lanes.iter().enumerate()
+        let mut slots: Vec<usize> = self.lanes.iter().enumerate()
             .filter(|(_, l)| l.is_some())
             .map(|(i, _)| i)
             .collect();
+        // KVPOOL: every round of every arm below writes at or just past a lane's position — map ahead of it here,
+        // the one place all decode rounds pass (the fast path is an atomic load per lane). A lane the pool cannot
+        // grow ends ITS request and drops out of this round; the empty check below is then what skips a round,
+        // with upstream's own return — the only one ahead of the round counter (benchfix_sse_tests pins it).
+        if self.model.vmm_lazy() {
+            // `all` shrinks as lanes end: a lane that just left the round must be evictable for the next
+            // one, or its pages sit idle to the end of the step and later lanes end for want of them.
+            let mut all = slots.clone();
+            let live: Vec<(usize, usize)> = slots.iter().filter_map(|&s| self.lanes[s].as_ref().map(|l| (s, l.pos + 1))).collect();
+            let mut kept: Vec<(usize, usize)> = Vec::with_capacity(live.len());
+            let mut ended: Vec<usize> = Vec::new();
+            for (s, p) in live {
+                if self.vmm_room_or_end(s, p, &all)? { kept.push((s, p)); }
+                else { ended.push(s); all.retain(|&x| x != s); }
+            }
+            slots.retain(|s| !ended.contains(s));
+            self.model.vmm_ensure_group(&kept)?; // + the pooled-key planes out to the longest lane (small)
+        }
+
         if slots.is_empty() {
             return Ok(());
         }

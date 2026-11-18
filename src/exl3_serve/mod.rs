@@ -492,6 +492,10 @@ struct Exl3Scheduler {
     pf_done: std::collections::HashMap<usize, PfDone>,
     /// PACKPF: prompts whose packed prefill is in flight (FIFO order; their lanes are reserved).
     pf_jobs: Vec<PfJob>,
+    /// KVPOOL (fork, --kv-pool lazy): a text request whose prefill found the shared pool full, with no idle lane to
+    /// evict, while other lanes still decode. The scheduler loop puts it back at the head of the queue and admits it
+    /// again after the next decode round (a lane that finishes becomes idle and evictable) instead of failing it.
+    vmm_wait: Option<BatchRequest>,
     // VIS-2: the text config's interleaved mrope_section (rope_parameters.mrope_section; None = the
     // model declares no interleaved mrope -> image requests are refused)
     mrope_section: Option<[usize; 3]>,
