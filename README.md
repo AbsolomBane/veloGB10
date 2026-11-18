@@ -4,6 +4,16 @@
 
 # veloGB10
 
+> **Fork note (AbsolomBane/veloGB10):** this `main` is upstream [sf-stav/veloGB10](https://github.com/sf-stav/veloGB10)
+> unchanged apart from this note. The fork adds an opt-in **shared KV pool across lanes** (many lanes share one physical
+> KV budget: a long 1M session plus agents on one GX10), in three independent branches cut from v0.7.10:
+> [`feature/fit-floor-gb`](https://github.com/AbsolomBane/veloGB10/tree/feature/fit-floor-gb) (`--fit-floor-gb`),
+> [`feature/kv-pool`](https://github.com/AbsolomBane/veloGB10/tree/feature/kv-pool) (the pool, on top of it; design and tests in
+> [KV_POOL.md](https://github.com/AbsolomBane/veloGB10/blob/feature/kv-pool/KV_POOL.md)) and
+> [`feature/bench-tools`](https://github.com/AbsolomBane/veloGB10/tree/feature/bench-tools) (benchmark scripts).
+> [`kv-pool-0710`](https://github.com/AbsolomBane/veloGB10/tree/kv-pool-0710) is all of it integrated, as we run it.
+> The older [`kv-pool`](https://github.com/AbsolomBane/veloGB10/tree/kv-pool) branch is the v0.7.9 version, kept for history.
+
 **A GB10-specific inference engine for one, two or four GB10-based systems — NVIDIA DGX Spark and
 compatible OEM machines built around the NVIDIA GB10 chipset.**
 
