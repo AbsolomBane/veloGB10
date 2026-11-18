@@ -117,7 +117,8 @@ pub(super) fn serve_options_boot_line() -> Result<String, String> {
 /// line, when the server binds.)
 pub fn check_serve_options(args: &[String]) -> Result<(), String> {
     serve_options_boot_line()?;
-    stall_drill_topology(crate::opts::get(crate::opt!("inject-stall")).is_some(), args)
+    stall_drill_topology(crate::opts::get(crate::opt!("inject-stall")).is_some(), args)?;
+    crate::kv_vmm::tp_topology(crate::kv_vmm::mode_from_opts().is_some(), args)
 }
 
 /// `--inject-stall` is a one-box drill: it puts ONE process's scheduler thread to sleep. On a TP

@@ -100,6 +100,8 @@ ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
 
   KV / PREFIX CACHE
     --kv-mirror-budget <N>             packed-KV mirror budget (positions)  [32768]
+    --kv-pool <off|full|lazy>          EXL3 server, one box: back the per-lane position planes (KV, indexer keys, pooled keys, MTP head KV) with CUDA virtual memory so every lane draws physical pages from ONE pool shared by all lanes. off = today's fixed per-lane allocation, byte-for-byte; full = every page mapped at boot (same memory as off; proves the plumbing); lazy = pages mapped on demand from a pool of --kv-pool-gb, an idle lane is evicted (its prompt kept by the prefix pool / spill tier) when the pool is full, and a running lane the pool cannot grow ends with finish=length. Kernels and copy paths are unchanged (virtual addresses never move, CUDA graphs stay valid). Refused with --tp / --head / --node  [off]
+    --kv-pool-gb <N>                   --kv-pool lazy: size of the shared physical page pool in GB (decimal GB, as the boot fit line; a whole number). Default unset = large enough for every lane's full window (no saving); e.g. 30 holds ~1.6M positions of a Flash-Next 3.05 model shared by 8 lanes of 1M  [unset]
     --next-turn-chunk <N>              --next-turn-prefill: rows per background prefill chunk - the longest a request that arrives during a background pass waits (about 0.2-0.3 s at 512 on Flash-Next at TP=1)  [512]
     --next-turn-delay-ms <N>           --next-turn-prefill: a background pass starts only this long after the reply went out with the box idle all along, so an agent that sends its next request at once (a fast tool) never waits behind a pass (its request then reads the reply itself, as without the flag)  [150]
     --next-turn-prefill <on|off|inline>
@@ -392,7 +394,7 @@ ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
 
   LOADING / MEMORY
     --dequant-at-load                  dequantize weights at load  [off]
-    --fit-floor-gb <N>                 EXL3 serve fit: the free memory (GB) the boot plan keeps after weights, tables and lanes. Default 20 (the serving-headroom bar); never below --mem-watchdog-gb  [20] (per box)
+    --fit-floor-gb <N>                 EXL3 serve fit: the free memory (GB) the boot plan keeps after weights, tables, lanes and the KV pool. Default 20 (the serving-headroom bar); never below --mem-watchdog-gb  [20] (per box)
     --load-force <1|unsafe>            bypass the load memory guard (unsafe = also on qwen4_exp)  [off]
     --load-pipe-cap-gb <N>             load pipeline cap (GB)  [built-in]
     --load-sync-upload                 load: synchronous uploads  [off]

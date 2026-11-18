@@ -87,6 +87,7 @@ pub mod metrics;
 pub mod mtp_reprobe;
 pub mod lane_pack; // S-B9-CF-PACK4: --lane-pack (pure decision; the arm lives in exl3_serve)
 pub mod lane_reserve; // LANERES1: --lane-reserve (pure admission policy; the arm lives in exl3_serve)
+pub mod kv_vmm; // KVPOOL (fork): shared physical pool behind the position planes (--kv-pool)
 pub mod kv_spill; // LANERES2: --kv-spill (pure spill policy + disk store; the arm lives in exl3_serve/exl3_forward)
 pub mod turn_resume; // TURNRESUME: --turn-resume / --next-turn-prefill (hints, pick rules, counters; the arm lives in exl3_serve)
 pub mod prefix_pool; // PFXPOOL: prompt states kept in memory across lanes (policy; the arm lives in exl3_serve/exl3_forward)

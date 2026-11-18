@@ -1250,8 +1250,12 @@ pub const REG: &[Opt] = &[
           help: "--next-turn-prefill: rows per background prefill chunk - the longest a request that arrives during a background pass waits (about 0.2-0.3 s at 512 on Flash-Next at TP=1)" },
     Opt { flag: "ids-file", env: "", ty: Ty::Path, def: "unset", cat: Cat::Diag, scope: Scope::Local, vis: Vis::Adv,
           help: "--probe-copy-span-replay: JSON list of {name, prompt_ids, gen_ids} records (wvtools/phase0/dump_ids.py writes it)" },
+    Opt { flag: "kv-pool", env: "", ty: Ty::Choice(&["off", "full", "lazy"]), def: "off", cat: Cat::Kv, scope: Scope::Spmd, vis: Vis::Adv,
+          help: "EXL3 server, one box: back the per-lane position planes (KV, indexer keys, pooled keys, MTP head KV) with CUDA virtual memory so every lane draws physical pages from ONE pool shared by all lanes. off = today's fixed per-lane allocation, byte-for-byte; full = every page mapped at boot (same memory as off; proves the plumbing); lazy = pages mapped on demand from a pool of --kv-pool-gb, an idle lane is evicted (its prompt kept by the prefix pool / spill tier) when the pool is full, and a running lane the pool cannot grow ends with finish=length. Kernels and copy paths are unchanged (virtual addresses never move, CUDA graphs stay valid). Refused with --tp / --head / --node" },
+    Opt { flag: "kv-pool-gb", env: "", ty: Ty::IntRange(1, 4096), def: "unset", cat: Cat::Kv, scope: Scope::Spmd, vis: Vis::Adv,
+          help: "--kv-pool lazy: size of the shared physical page pool in GB (decimal GB, as the boot fit line; a whole number). Default unset = large enough for every lane's full window (no saving); e.g. 30 holds ~1.6M positions of a Flash-Next 3.05 model shared by 8 lanes of 1M" },
     Opt { flag: "fit-floor-gb", env: "", ty: Ty::IntRange(0, 128), def: "20", cat: Cat::Load, scope: Scope::Local, vis: Vis::Adv,
-          help: "EXL3 serve fit: the free memory (GB) the boot plan keeps after weights, tables and lanes. Default 20 (the serving-headroom bar); never below --mem-watchdog-gb" },
+          help: "EXL3 serve fit: the free memory (GB) the boot plan keeps after weights, tables, lanes and the KV pool. Default 20 (the serving-headroom bar); never below --mem-watchdog-gb" },
 ];
 
 /// Environment variables that were read once and are gone (merged into an existing flag, or dead):
