@@ -223,6 +223,10 @@ impl FwdModel {
         let per_s = cfg.lin_num_v_heads * cfg.lin_k_dim * cfg.lin_v_dim;
         let l = Launcher { dev: &self.dev, stream: &self.stream };
         let grid = |n: usize| (((n + 255) / 256) as u32, 1, 1);
+        // KVPOOL: a reset lane's position rows are dead (every caller prefills from row 0 next, write-before-read):
+        // hand their pages back to the pool before anything below touches the lane.
+        let lazy = self.vmm_lazy();
+        if lazy { self.vmm_truncate(slot, 0)?; }
         for cs in &self.conv_state {
             let n = per_conv as i64;
             xqlaunch!(l, "xq_memset_f32", grid(per_conv), (256, 1, 1), 0,
@@ -239,7 +243,20 @@ impl FwdModel {
         // losslessness — verify rejects — but they drift acceptance round to round).
         if let Some(head) = &self.mtp {
             let per = (head.kv.len() / self.width / 4) as i64; // f32 words (row bytes are % 16)
-            if !skip_head_kv {
+            if lazy {
+                // KVPOOL: only the mapped rows of each K|V segment exist — zero (or poison) those; rows mapped later
+                // are written before they are read (the PFX1 (b) invariant above) or zero/poisoned by the next reset.
+                if !skip_head_kv || pfx1_headkv_poison() {
+                    let rows = self.vmm_rows_mapped(slot).min(self.max_pos);
+                    let hrb = kv_rowbytes(self.kv_fmt, self.cfg.head_dim);
+                    let val = if skip_head_kv { 0x7FC0i32 } else { 0i32 };
+                    for (at, bytes) in spill_row_regions(*head.kv.device_ptr() as u64, head.kv.len(), self.width, slot,
+                                                         self.max_pos, hrb, rows)? {
+                        let n = (bytes / 2) as i64;
+                        xqlaunch!(l, "xq_memset_u16", grid(n as usize), (256, 1, 1), 0, (at, n, val))?;
+                    }
+                }
+            } else if !skip_head_kv {
                 xqlaunch!(l, "xq_memset_f32", grid(per as usize), (256, 1, 1), 0,
                           (&head.kv, (slot as i64) * per, per))?;
             } else if pfx1_headkv_poison() {
@@ -410,6 +427,110 @@ impl FwdModel {
         Ok(())
     }
 
+    // ---------------------------------------------------------- KVPOOL (fork): on-demand position rows
+    /// True when the position planes are VMM-backed and mapped on demand.
+    pub fn vmm_lazy(&self) -> bool {
+        self.vmm.as_ref().map_or(false, |v| v.lock().unwrap().mode() == crate::kv_vmm::Mode::Lazy)
+    }
+    /// KVPOOL: lane `slot` is about to touch position rows `< rows` (written or read). Maps what is missing, with
+    /// `VMM_MARGIN_ROWS` ahead (a round's draft chain, the dense-v3 last-tile prefetch and the pooled-key block all
+    /// reach a little past the lane's position). The fast path is one atomic load. Err = the pool is exhausted
+    /// (nothing unmapped; the caller frees a lane or fails the request).
+    pub fn vmm_ensure(&self, slot: usize, rows: usize) -> Result<()> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(()) };
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(slot < self.width, "kv-vmm: slot {slot} >= width {}", self.width);
+        let want = crate::kv_vmm::rows_grid(rows + VMM_MARGIN_ROWS, self.max_pos);
+        if want <= self.vmm_rows[slot].load(Relaxed) { return Ok(()); }
+        let mut g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { self.vmm_rows[slot].store(self.max_pos, Relaxed); return Ok(()); }
+        self.dev.bind_to_thread()?;
+        let planes = self.pool_planes(slot)?;
+        for &(at, rb, div, cap) in &planes {
+            // pooled planes: one block of read-ahead, clamped to the lane's kernel extent (pool_planes IS the kernel geometry)
+            let units = if div > 1 { want.div_ceil(div) + 1 } else { want };
+            if let Err(e) = g.ensure(at, units.min(cap) * rb) {
+                // pool exhausted part-way: give back what this call mapped, so the lane is exactly as before (its
+                // counters still describe it; eviction and vmm_truncate see every page it holds)
+                let (r, p) = (self.vmm_rows[slot].load(Relaxed), self.vmm_pool_rows[slot].load(Relaxed));
+                vmm_rollback(&mut g, &planes, r, r.max(p));
+                return Err(e);
+            }
+        }
+        self.vmm_rows[slot].store(want, Relaxed);
+        self.vmm_pool_rows[slot].fetch_max(want, Relaxed);
+        Ok(())
+    }
+    /// KVPOOL: the lanes of one multi-lane launch reach position rows `< rows` between them. The mixed-row pooled
+    /// scorer (`qsa_score_pooled_mr`, gpu_batch.cu) prefetches the FIRST row's lane out to the group's largest block
+    /// count before its per-row guard, and the plain step orders short lanes first: a short lane's pooled-key planes
+    /// must be mapped out to the longest lane of the launch. Pooled keys only (64 B a row on Flash-Next: 64 MiB a lane
+    /// at a 1M window) — never the KV or raw-key planes.
+    pub fn vmm_ensure_pooled(&self, slot: usize, rows: usize) -> Result<()> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(()) };
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(slot < self.width, "kv-vmm: slot {slot} >= width {}", self.width);
+        let want = crate::kv_vmm::rows_grid(rows + VMM_MARGIN_ROWS, self.max_pos);
+        if want <= self.vmm_pool_rows[slot].load(Relaxed) { return Ok(()); }
+        let mut g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { self.vmm_pool_rows[slot].store(self.max_pos, Relaxed); return Ok(()); }
+        self.dev.bind_to_thread()?;
+        let planes = self.pool_planes(slot)?;
+        for &(at, rb, div, cap) in &planes {
+            if div <= 1 { continue; }
+            if let Err(e) = g.ensure(at, (want.div_ceil(div) + 1).min(cap) * rb) {
+                let (r, p) = (self.vmm_rows[slot].load(Relaxed), self.vmm_pool_rows[slot].load(Relaxed));
+                vmm_rollback(&mut g, &planes, r, r.max(p));
+                return Err(e);
+            }
+        }
+        self.vmm_pool_rows[slot].store(want, Relaxed);
+        Ok(())
+    }
+    /// KVPOOL: `vmm_ensure` for every lane of one launch at its own position + the pooled-key planes of all of them
+    /// out to the longest (see `vmm_ensure_pooled`). `lanes` = (slot, next position).
+    pub fn vmm_ensure_group(&self, lanes: &[(usize, usize)]) -> Result<()> {
+        if self.vmm.is_none() { return Ok(()); }
+        let top = lanes.iter().map(|l| l.1).max().unwrap_or(0);
+        for &(s, p) in lanes {
+            self.vmm_ensure(s, p)?;
+            if lanes.len() > 1 { self.vmm_ensure_pooled(s, top)?; }
+        }
+        Ok(())
+    }
+    /// KVPOOL: lane `slot` no longer needs rows `>= keep` (0 = the lane is empty): return their pages to the pool.
+    /// `VMM_FLOOR_ROWS` stay mapped on every lane (boot probes, diagnostics and the prime cross-checks touch the first
+    /// rows of a lane without a request). Synchronizes the device first: no queued kernel may still read those rows.
+    pub fn vmm_truncate(&self, slot: usize, keep: usize) -> Result<()> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(()) };
+        use std::sync::atomic::Ordering::Relaxed;
+        let keep = crate::kv_vmm::rows_grid(keep.max(VMM_FLOOR_ROWS) + VMM_MARGIN_ROWS, self.max_pos);
+        if keep >= self.vmm_rows[slot].load(Relaxed) && keep >= self.vmm_pool_rows[slot].load(Relaxed) { return Ok(()); }
+        let mut g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { return Ok(()); }
+        self.dev.bind_to_thread()?;
+        self.dev.synchronize()?;
+        unsafe { cudarc::driver::result::stream::synchronize(self.stream.stream)?; }
+        // Publish the reduced counts BEFORE the first unmap: if an unmap fails part-way, the next ensure must not
+        // take its fast path over rows that are already gone (pages still mapped are simply skipped by it).
+        self.vmm_rows[slot].store(keep, Relaxed);
+        self.vmm_pool_rows[slot].store(keep, Relaxed);
+        for (at, rb, div, cap) in self.pool_planes(slot)? {
+            // pooled planes keep the partial-group block too (see vmm_ensure); `cap` is the lane's kernel extent
+            let k = (if div > 1 { keep.div_ceil(div) + 1 } else { keep }).min(cap);
+            g.drop_range(at + (k * rb) as u64, (cap - k) * rb)?;
+        }
+        Ok(())
+    }
+    /// KVPOOL: (pool bytes, mapped bytes, reserved bytes) — None when the pool is off.
+    pub fn vmm_stats(&self) -> Option<(usize, usize, usize)> {
+        self.vmm.as_ref().map(|v| { let g = v.lock().unwrap(); (g.pool_bytes(), g.mapped_bytes(), g.reserved_bytes()) })
+    }
+    /// KVPOOL: rows of `slot` currently mapped.
+    pub fn vmm_rows_mapped(&self, slot: usize) -> usize {
+        self.vmm_rows.get(slot).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// PFXPOOL2: the positional planes of `slot`, in `spill_regions` order: (address of the slot's unit 0, bytes per
     /// unit, rows per unit, units in the plane). A unit is a row, or a pooled QSA block of `indexer_compress_ratio` rows.
     fn pool_planes(&self, slot: usize) -> Result<Vec<(u64, usize, usize, usize)>> {
@@ -479,6 +600,7 @@ impl FwdModel {
     /// (laid out by `pool_capture_rows`). a and e0 are on the row grid; e0 <= a <= b <= e1. Compute stream, no sync.
     pub fn pool_restore_rows_part(&self, slot: usize, a: usize, b: usize, e0: usize, e1: usize, src: u64) -> Result<()> {
         anyhow::ensure!(e0 <= a && a <= b && b <= e1, "pool: rows {a}..{b} outside the entry's {e0}..{e1}");
+        self.vmm_ensure(slot, b)?; // KVPOOL
         let mut off = 0u64;
         for (at, rb, div, cap) in self.pool_planes(slot)? {
             let (eu0, eu1) = Self::pool_units(e0, e1, div, cap);
@@ -586,6 +708,7 @@ impl FwdModel {
         // payload = Store::get's payload: the capture body (its own 36B header: MAGIC, ver,
         // tokens, nreg, total), then the regions, then the 8B hist tail.
         let tokens = self.spill_restore_check(slot, payload)?;
+        self.vmm_ensure(slot, spill_rows(tokens, if self.cfg.has_indexer() { self.cfg.indexer_compress_ratio } else { 1 }, self.max_pos))?; // KVPOOL
         let bytes = payload;
         let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
         self.dsync()?;
@@ -741,4 +864,15 @@ impl FwdModel {
         mx
     }
 
+}
+
+/// KVPOOL: undo a failed `vmm_ensure` / `vmm_ensure_pooled`: unmap every page of the lane above the extent its counters
+/// already describe (`rows` for the KV / raw-key planes, `pooled` for the pooled-key planes), with the same per-plane
+/// formula as `vmm_truncate`. No device sync: the pages it can drop were mapped by the failed call itself, so no queued
+/// kernel references them. Best effort: an unmap error leaves the page registered (Drop still frees it).
+fn vmm_rollback(g: &mut crate::kv_vmm::KvVmm, planes: &[(u64, usize, usize, usize)], rows: usize, pooled: usize) {
+    for &(at, rb, div, cap) in planes {
+        let k = (if div > 1 { pooled.div_ceil(div) + 1 } else { rows }).min(cap);
+        let _ = g.drop_range(at + (k * rb) as u64, (cap - k) * rb);
+    }
 }
