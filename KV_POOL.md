@@ -22,7 +22,7 @@ from **one shared pool** and are mapped only for the rows a lane actually uses.
 
 ## Scope and limits
 
-* Tested on one GX10 (TP=1) only.
+* Tested on one GB10 (ASUS GX10) (TP=1) only.
 * **Lazy mode costs two diagnostic routes.** The WP16 head-KV poison gate (`exl3_forward/wp16.rs:419`)
   returns early under lazy, so the PFX1 (b) "every head-KV row a draft can read was written first"
   invariant can no longer be PROVEN with the pool in lazy — the reset path still zeroes/poisons only
@@ -40,7 +40,7 @@ from **one shared pool** and are mapped only for the rows a lane actually uses.
 
 ## Usage — the recipe we run in production (the memory figures in this section were measured on the v0.7.9 base)
 
-One GX10 (128 GB), Qwen3.8-Flash-Next EXL3 3.05: **8 lanes x 1M context each, one shared 30 GB KV pool.**
+One GB10 (ASUS GX10, 128 GB), Qwen3.8-Flash-Next EXL3 3.05: **8 lanes x 1M context each, one shared 30 GB KV pool.**
 
 ```
 mkdir -p ~/velo-spill
@@ -92,7 +92,7 @@ floor from upstream's 20 GB; the pool itself is what bounds KV memory.
 
 Scripts (decode streams, needle, VeloBench runner, live monitor): branch `feature/bench-tools`.
 
-## Tested on v0.7.10 (2026-11-18, one ASUS GX10 / GB10, Qwen3.8-Flash-Next EXL3 3.05, YaRN x4, q8 KV, PLE on SSD)
+## Tested on v0.7.10 (2026-11-18, one GB10 (ASUS GX10), Qwen3.8-Flash-Next EXL3 3.05, YaRN x4, q8 KV, PLE on SSD)
 
 Reference = plain v0.7.10 (0642b78) built from the tag on the same box, same flags. Greedy = temperature 0, seed 42.
 Pool runs use `--kv-pool lazy`. Every row below was measured on this branch (the first rows on `c0d872d`, the
@@ -177,7 +177,7 @@ servers; it does not change the speed comparison.
   sooner, and first token in under a second instead of 1-1.6 minutes in the queue.
 * Free memory while serving: ~16-17 GiB on the fork (8 lanes) vs ~13 GiB on the official build (2 lanes).
 
-## Measured (ASUS GX10 / GB10, Qwen3.8-Flash-Next EXL3 3.05, YaRN x4, q8 KV, PLE on SSD) — every row below is from the v0.7.9 base and has NOT been re-run on v0.7.10
+## Measured (GB10 / ASUS GX10, Qwen3.8-Flash-Next EXL3 3.05, YaRN x4, q8 KV, PLE on SSD) — every row below is from the v0.7.9 base and has NOT been re-run on v0.7.10
 
 | Test | Result |
 |---|---|
