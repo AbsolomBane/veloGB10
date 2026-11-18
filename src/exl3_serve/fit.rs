@@ -226,6 +226,6 @@ pub fn fit_parts(model_dir: &str, max_pos: usize, world: usize, head: bool, kv_b
     // plan. The serve fit reserves the owner's §5 serving-headroom bar instead: ~20 GB free per box on a serving
     // posture ("lower is good"); the watchdog keeps its own floor as the last resort below that.
     let watch_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
-    let floor_gb = watch_gb.max(20.0);
+    let floor_gb = watch_gb.max(crate::opts::var(crate::opt!("fit-floor-gb")).ok().and_then(|v| v.parse().ok()).unwrap_or(20.0));
     Some(FitParts { weights, table, per_lane, fixed, floor: (floor_gb * 1e9) as u64 })
 }

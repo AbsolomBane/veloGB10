@@ -1250,6 +1250,8 @@ pub const REG: &[Opt] = &[
           help: "--next-turn-prefill: rows per background prefill chunk - the longest a request that arrives during a background pass waits (about 0.2-0.3 s at 512 on Flash-Next at TP=1)" },
     Opt { flag: "ids-file", env: "", ty: Ty::Path, def: "unset", cat: Cat::Diag, scope: Scope::Local, vis: Vis::Adv,
           help: "--probe-copy-span-replay: JSON list of {name, prompt_ids, gen_ids} records (wvtools/phase0/dump_ids.py writes it)" },
+    Opt { flag: "fit-floor-gb", env: "", ty: Ty::IntRange(0, 128), def: "20", cat: Cat::Load, scope: Scope::Local, vis: Vis::Adv,
+          help: "EXL3 serve fit: the free memory (GB) the boot plan keeps after weights, tables and lanes. Default 20 (the serving-headroom bar); never below --mem-watchdog-gb" },
 ];
 
 /// Environment variables that were read once and are gone (merged into an existing flag, or dead):

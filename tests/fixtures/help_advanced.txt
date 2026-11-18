@@ -392,6 +392,7 @@ ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
 
   LOADING / MEMORY
     --dequant-at-load                  dequantize weights at load  [off]
+    --fit-floor-gb <N>                 EXL3 serve fit: the free memory (GB) the boot plan keeps after weights, tables and lanes. Default 20 (the serving-headroom bar); never below --mem-watchdog-gb  [20] (per box)
     --load-force <1|unsafe>            bypass the load memory guard (unsafe = also on qwen4_exp)  [off]
     --load-pipe-cap-gb <N>             load pipeline cap (GB)  [built-in]
     --load-sync-upload                 load: synchronous uploads  [off]
