@@ -1,6 +1,6 @@
 # Shared KV pool (AbsolomBane/veloGB10, branch `feature/kv-pool`, on top of `feature/fit-floor-gb`)
 
-This feature is developed with strong assistance from an AI model (Claude, by Anthropic), with a human architect (AbsolomBane) leading the design, the technical direction, the testing and the production use. We say this openly, as velo itself does.
+This feature is developed with strong assistance from AI models: Claude (Anthropic) for design, code and tests, OpenAI Astra for independent cross-checks, and Qwen3.8-Flash-Next running locally on velo itself for heavy local analysis and testing, with a human architect (AbsolomBane) leading the design, the technical direction, the testing and the production use. We say this openly, as velo itself does.
 Base: veloGB10 v0.7.10 by sf-stav (Apache-2.0) — this branch is the port of the `kv-pool` work from v0.7.9. Everything below is opt-in: without `--kv-pool` (default off) the engine behaves as v0.7.10.
 
 ## What it does
