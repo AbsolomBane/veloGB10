@@ -1,4 +1,13 @@
-# Shared KV pool (AbsolomBane/veloGB10, branch `feature/kv-pool-0710`, on top of `feature/fit-floor-gb`)
+# Shared KV pool (AbsolomBane/veloGB10, branch `feature/kv-pool-tp-0710`, on v0.7.10)
+
+> **Status:** the pool is tested on one GB10 (ASUS GX10), TP=1 (every figure below). This branch also carries the
+> **TP=2/4 groundwork**, written and covered by CPU tests only: **never run on TP hardware**, and the pool is still
+> refused at startup with any TP role. If you have a TP=2 or TP=4 rig and want to contribute, see
+> [TP=2/4: help wanted](#tp24-help-wanted) below.
+>
+> The GPU figures were measured on the pool code before the TP commits. Those commits touch the one-box path only
+> through read-only refactors (the lane pick, the eviction order) and the group read-ahead exhaustion, and that part
+> is covered by CPU tests, not yet re-measured on the GPU.
 
 This feature is developed with strong assistance from AI models: Claude (Anthropic) for design, code and tests, OpenAI Astra for independent cross-checks, and Qwen3.8-Flash-Next running locally on velo itself for heavy local analysis and testing, with a human architect (AbsolomBane) leading the design, the technical direction, the testing and the production use.
 Base: veloGB10 v0.7.10 by sf-stav (Apache-2.0) — this branch is the port of the `kv-pool` work from v0.7.9. Everything below is opt-in: without `--kv-pool` (default off) the engine behaves as v0.7.10.
@@ -36,7 +45,29 @@ from **one shared pool** and are mapped only for the rows a lane actually uses.
   self-tests, the packstate probe, `--probe-exl3-packpf`, and `--probe-exl3-prefillx` with `--prefillx-qsa-keys`,
   `--prefillx-rel` or `--prefillx-tier`. Use `--kv-pool full` (or off) for them.
 * A waiting request blocks the queue behind it (FIFO), as a request waiting for a free lane does today.
-* **TP=2: not tried.** The pooled-QSA copy geometry (the fork's old fix B) is upstream since v0.7.10 and is identical on every rank. The pool's on-demand mapping runs in the forward paths that both ranks execute, but **pool-full eviction is disabled under TP** (`vmm_evict_idle` returns early): an eviction would have to be mirrored to the node in the same step, and there is no such event yet. **Open risk, never tested:** when the pool fills at TP>1 the decode map-ahead ends the overflowing lane's request on the rank that hit the limit, so `slots` changes on that rank only — if the ranks do not exhaust in the same step their lane sets diverge and a collective can hang. The prefill route is worse: `vmm_room`'s error reaches `admission.rs:228-233`, which sets `self.fatal` whenever `tp.is_some()`, so under TP a pool exhaustion during a prefill takes the whole engine down rather than one request. This is the same behaviour the fork had at v0.7.9; TP with the pool has never been run, so treat it as unsupported until the TP gate in raport.md is executed.
+* **TP=2/4: groundwork only, never run on TP hardware** (see the next section). The pool stays refused under TP.
+
+## TP=2/4: help wanted
+
+We have one GB10, so nothing here has run at TP>1. What the branch adds for TP (CPU tests only, `cargo test --lib` 1238/1238):
+
+* **Dry-run page queries** in `KvVmm` (`pages_needed`, `pages_freed`, `pages_needed_union`) and their `FwdModel` twins
+  (`vmm_pages_needed`, `vmm_pages_freed`), built on the same page tables and unit math as the real map/unmap.
+* **A lane-set agree after the decode map-ahead** (`step.rs`): every rank compares the survivor count and the ordered
+  slot ids before any return, so a lane ended on one rank only cannot reach the next collective.
+* **A spill vote on a failed capture** (`pool.rs`): a rank whose D2H capture fails still votes `false` (upstream v0.7.10
+  returns before the vote; `spill_agree_tests` shows what that does to the next votes).
+* **The head's capacity gate** (`tp_pool_gate.rs`): before an Admit ships, the pages the prompt needs on the lane the apply
+  will pick (restore target included); held while a lane runs, refused with an error when nothing can make room; one
+  Admit per iteration while it decides. Victims are not credited yet (`TP_EVICTS = false`): eviction stays single-box.
+* **Group read-ahead exhaustion ends a lane** (`finish=length`) instead of failing the step (single box too).
+
+Still missing before the refusal can be lifted: replicated eviction under TP (and `TP_EVICTS`), a per-slot cache
+fingerprint in the round digest, and a run on real TP hardware. On a TP=2 rig, with the refusal in
+`kv_vmm::tp_topology` removed locally, the checks that matter are: greedy outputs identical to plain v0.7.10 TP; a pool
+small enough to fill on both ranks (lanes must end `finish=length` on the same lane on every rank, no hang, no fatal); a
+prompt that does not fit (held, never a fatal); eviction and a cross-lane restore once eviction is replicated; and the
+needle at 1M. Reports (logs of both ranks) are welcome as issues on this fork.
 
 ## Usage — the recipe we run in production (the memory figures in this section were measured on the v0.7.9 base)
 
