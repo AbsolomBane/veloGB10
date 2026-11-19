@@ -24,3 +24,16 @@
             }
         }
     }
+
+    /// TPPOOL (design v2 step 3): under TP a rank whose spill capture fails must still vote, or the peer that
+    /// reached the SpillFlag exchange waits for a frame that never comes (TP=2 has no read deadline there).
+    #[test]
+    fn a_failed_capture_still_casts_its_spill_vote() {
+        let src = src_text!("exl3_serve");
+        let at = src.find("pub(super) fn spill_capture_slot(").expect("spill_capture_slot");
+        let body = &src[at..at + src[at..].find("\n    pub(").unwrap_or(src.len() - at)];
+        let fail = body.find("kv spill: capture failed slot=").expect("the capture-failure arm");
+        let ret = fail + body[fail..].find("return Ok(());").expect("the arm returns");
+        assert!(body[fail..ret].contains("spill_agree(false)"), "the capture-failure arm must vote before it returns");
+    }
+

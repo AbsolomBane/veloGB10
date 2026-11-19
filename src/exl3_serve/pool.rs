@@ -439,6 +439,11 @@ impl Exl3Scheduler {
             if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
                 crate::metrics::kv_spill_miss_recompute();
                 crate::dreprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+                // TPPOOL (design v2 step 3): a rank-local capture failure must still cast its vote. The peers
+                // reach the SpillFlag exchange below and would wait for this rank's frame (TP=2 has no read
+                // deadline there). Voting "no" keeps the exchange paired; the AND verdict drops the key on
+                // every rank, exactly as a failed write does.
+                if let Some(t) = self.tp.as_mut() { let _ = t.spill_agree(false)?; }
                 return Ok(());
             }
             crate::kv_spill::finalize_header(&mut buf, tokens);
