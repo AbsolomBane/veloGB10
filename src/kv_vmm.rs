@@ -71,6 +71,22 @@ struct Plane {
     pages: Vec<u32>,
 }
 
+/// KVPOOL (v2 dry-run): page bounds exactly as `ensure` walks them (every page the range touches) and as
+/// `drop_range` frees them (only pages wholly inside the range). Pure arithmetic, shared by the real calls
+/// and the dry-run queries below, so the head's capacity gate and the apply path cannot disagree.
+pub fn ensure_page_bounds(off: usize, len: usize) -> (usize, usize) {
+    (off / PAGE, (off + len).div_ceil(PAGE))
+}
+pub fn drop_page_bounds(off: usize, len: usize) -> (usize, usize) {
+    (off.div_ceil(PAGE), (off + len) / PAGE)
+}
+/// Pages in `pages[p0..p1]` that are unmapped (`want_mapped == false`) or mapped (`true`).
+pub fn count_pages(pages: &[u32], (p0, p1): (usize, usize), want_mapped: bool) -> usize {
+    let p1 = p1.min(pages.len());
+    if p0 >= p1 { return 0; }
+    pages[p0..p1].iter().filter(|&&h| (h != 0) == want_mapped).count()
+}
+
 pub struct KvVmm {
     mode: Mode,
     dev_id: i32,
@@ -154,12 +170,26 @@ impl KvVmm {
 
     /// Make every page under `[at, at+len)` mapped. Returns the pages newly mapped (0 = nothing to do).
     /// Err (nothing half-done that matters: pages mapped so far stay mapped) when the pool is exhausted.
+    /// KVPOOL (v2): how many pages `ensure(at, len)` would map right now (0 = nothing to do). Dry run: changes nothing.
+    pub fn pages_needed(&self, at: u64, len: usize) -> Result<usize> {
+        if len == 0 { return Ok(0); }
+        let pi = self.plane_of(at, len)?;
+        let base = self.planes[pi].base;
+        Ok(count_pages(&self.planes[pi].pages, ensure_page_bounds((at - base) as usize, len), false))
+    }
+    /// KVPOOL (v2): how many mapped pages `drop_range(at, len)` would return to the pool. Dry run: changes nothing.
+    /// Full mode maps everything and never drops, so it frees 0.
+    pub fn pages_freed(&self, at: u64, len: usize) -> Result<usize> {
+        if self.mode == Mode::Full || len == 0 { return Ok(0); }
+        let pi = self.plane_of(at, len)?;
+        let base = self.planes[pi].base;
+        Ok(count_pages(&self.planes[pi].pages, drop_page_bounds((at - base) as usize, len), true))
+    }
     pub fn ensure(&mut self, at: u64, len: usize) -> Result<usize> {
         if len == 0 { return Ok(0); }
         let pi = self.plane_of(at, len)?;
         let (base, zero) = (self.planes[pi].base, self.planes[pi].zero);
-        let p0 = ((at - base) as usize) / PAGE;
-        let p1 = ((at - base) as usize + len).div_ceil(PAGE);
+        let (p0, p1) = ensure_page_bounds((at - base) as usize, len);
         let mut acc: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
         acc.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
         acc.location.id = self.dev_id;
@@ -191,8 +221,7 @@ impl KvVmm {
         if self.mode == Mode::Full || len == 0 { return Ok(0); }
         let pi = self.plane_of(at, len)?;
         let base = self.planes[pi].base;
-        let p0 = ((at - base) as usize).div_ceil(PAGE);
-        let p1 = ((at - base) as usize + len) / PAGE;
+        let (p0, p1) = drop_page_bounds((at - base) as usize, len);
         let mut n = 0usize;
         for pg in p0..p1 {
             let h = self.planes[pi].pages[pg];
@@ -265,5 +294,41 @@ mod tests {
             let e = tp_topology(true, &a(&["--server", role])).unwrap_err();
             assert!(e.starts_with("--kv-pool is one-box only and is refused with --"), "{e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod dry_run_tests {
+    use super::*;
+    #[test]
+    fn ensure_bounds_cover_every_touched_page() {
+        assert_eq!(ensure_page_bounds(0, 1), (0, 1));
+        assert_eq!(ensure_page_bounds(PAGE - 1, 2), (0, 2));          // straddles a boundary: both pages
+        assert_eq!(ensure_page_bounds(PAGE, PAGE), (1, 2));
+        assert_eq!(ensure_page_bounds(3 * PAGE, 0), (3, 3));          // empty
+    }
+    #[test]
+    fn drop_bounds_free_only_wholly_covered_pages() {
+        assert_eq!(drop_page_bounds(0, PAGE), (0, 1));
+        assert_eq!(drop_page_bounds(1, PAGE), (1, 1));                 // straddles both edges: nothing wholly inside
+        assert_eq!(drop_page_bounds(PAGE, 2 * PAGE), (1, 3));
+        assert_eq!(drop_page_bounds(PAGE - 1, PAGE + 2), (1, 2));      // covers page 1 wholly
+    }
+    #[test]
+    fn boundary_page_is_counted_once_in_a_union_not_per_lane() {
+        // lane A: [0, PAGE+1) needs pages 0,1; lane B: [PAGE+1, 2*PAGE+5) needs pages 1,2 (page 1 is shared)
+        let pages = [0u32, 0, 0, 0];
+        let a = count_pages(&pages, ensure_page_bounds(0, PAGE + 1), false);
+        let b = count_pages(&pages, ensure_page_bounds(PAGE + 1, PAGE + 4), false);
+        let union = count_pages(&pages, (0, 3), false);
+        assert_eq!((a, b, union), (2, 2, 3));   // per-lane sum double-counts page 1: never sum ensure queries across lanes
+    }
+    #[test]
+    fn count_pages_respects_mapped_and_unmapped() {
+        let pages = [0u32, 7, 0, 3, 0];
+        assert_eq!(count_pages(&pages, (0, 5), false), 3);
+        assert_eq!(count_pages(&pages, (0, 5), true), 2);
+        assert_eq!(count_pages(&pages, (2, 2), false), 0);            // empty range
+        assert_eq!(count_pages(&pages, (3, 99), true), 1);            // clamped to the plane
     }
 }

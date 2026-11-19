@@ -176,6 +176,15 @@ impl Exl3Scheduler {
             self.model.vmm_ensure_group(&kept)?; // + the pooled-key planes out to the longest lane (small)
         }
 
+        // TPPOOL (design v2 step 2): after map-ahead every rank must hold the same lanes. A rank that ended a lane
+        // the other did not would diverge on the next collective, so agree on the survivor count and the ordered slot
+        // IDs here, before any return or dispatch. Runs only with a lazy pool under TP (the pool is refused under TP today).
+        if self.model.vmm_lazy() && self.tp.is_some() {
+            let agree: Vec<u32> = std::iter::once(slots.len() as u32).chain(slots.iter().map(|&s| s as u32)).collect();
+            // width = the survivor count (compared in the agree token's width field); no scratch: nothing ran yet
+            let (tp, model) = (&mut self.tp, &self.model);
+            if let Some(t) = tp.as_mut() { Self::tp_round_with(t, model, None, "map-ahead", 0, slots.len(), &agree, 0.0, 0.0, false)?; }
+        }
         if slots.is_empty() {
             return Ok(());
         }
