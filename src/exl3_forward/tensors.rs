@@ -345,6 +345,13 @@ pub(crate) fn spill_slot_region(base: u64, elems: usize, elem_bytes: usize, widt
 /// keys): through the end of the `ratio`-row block that holds position `tokens` — the restore resumes at `tokens`, rows
 /// at or past it are rewritten before they are read, and a pooled block is recomputed from all `ratio` raw rows of its
 /// block, so that whole block is carried bit for bit as an own-lane hit has it. Capped at `max_pos`.
+/// KVPOOL / TPPOOL (design v3 step 4): units of one position plane a lane holds for `rows` rows: a row per unit, or a
+/// pooled QSA block (`div` rows) plus one block of read-ahead, clamped to the plane (`cap`). The one formula
+/// `vmm_ensure`, `vmm_truncate` and their dry runs share.
+pub(crate) fn plane_units(rows: usize, div: usize, cap: usize) -> usize {
+    (if div > 1 { rows.div_ceil(div) + 1 } else { rows }).min(cap)
+}
+
 pub(crate) fn spill_rows(tokens: usize, ratio: usize, max_pos: usize) -> usize {
     let r = ratio.max(1);
     ((tokens + 1).div_ceil(r) * r).min(max_pos)

@@ -102,6 +102,18 @@ impl Exl3Scheduler {
                                                         cache.as_ref().map(|c| c.len()))));
     }
 
+    /// KVPOOL: the request on lane `s` ends at position `p` because the shared pool cannot grow it ("length": out of
+    /// context memory). Every rank calls it at the same program point (the map-ahead), so TP ranks drop the same lane.
+    fn vmm_end_lane(&mut self, s: usize, p: usize) {
+        crate::dreprintln!("[kv-vmm] slot {s}: the shared KV pool is full and no idle lane can be evicted — \
+                            request ended at position {p} (finish=length)");
+        if let Some(lane) = self.take_lane(s, true) {
+            lane.log_stats(s, "length");
+            let _ = lane.tx.send(TokEvent::Finish { reason: "length".into() });
+        }
+        self.publish_kv();
+    }
+
     /// KVPOOL: map lane `s` up to position `p`, evicting idle lanes while the pool is full. Ok(true) = the lane
     /// is mapped for this round; Ok(false) = the pool could not grow it and no idle lane was left to free, so
     /// the request on it ENDS here (finish=length) and the lane leaves the round — the other lanes still
@@ -114,13 +126,7 @@ impl Exl3Scheduler {
                     if self.vmm_evict_idle(keep)? { continue; }
                     // Nothing idle left to free: this lane cannot grow. End IT ("length": out of context
                     // memory) and it leaves this round; the other lanes still decode this step.
-                    crate::dreprintln!("[kv-vmm] slot {s}: the shared KV pool is full and no idle lane can be evicted — \
-                                        request ended at position {p} (finish=length)");
-                    if let Some(lane) = self.take_lane(s, true) {
-                        lane.log_stats(s, "length");
-                        let _ = lane.tx.send(TokEvent::Finish { reason: "length".into() });
-                    }
-                    self.publish_kv();
+                    self.vmm_end_lane(s, p);
                     return Ok(false);
                 }
                 Err(e) => return Err(e),
@@ -173,7 +179,24 @@ impl Exl3Scheduler {
                 else { ended.push(s); all.retain(|&x| x != s); }
             }
             slots.retain(|s| !ended.contains(s));
-            self.model.vmm_ensure_group(&kept)?; // + the pooled-key planes out to the longest lane (small)
+            // + the pooled-key planes out to the longest lane (small). TPPOOL (design v3 step 4): this read-ahead can
+            // exhaust the pool too. It used to fail the whole step (and under TP that is a fatal on every rank); now it
+            // evicts an idle lane, else ends the SHORTEST kept lane (the longest session goes last, as for eviction) and
+            // retries. One lane left needs no read-ahead, so this ends; every rank takes the same lanes in the same order.
+            loop {
+                let r = self.model.vmm_ensure_group(&kept);
+                match r {
+                    Err(e) if crate::kv_vmm::is_exhausted(&e) && kept.len() > 1 => {
+                        if self.vmm_evict_idle(&all)? { continue; }
+                        let &(s, p) = kept.iter().min_by_key(|&&(s, p)| (p, s)).unwrap();
+                        self.vmm_end_lane(s, p);
+                        kept.retain(|&(x, _)| x != s);
+                        slots.retain(|&x| x != s);
+                        all.retain(|&x| x != s);
+                    }
+                    r => { r?; break; }
+                }
+            }
         }
 
         // TPPOOL (design v2 step 2): after map-ahead every rank must hold the same lanes. A rank that ended a lane

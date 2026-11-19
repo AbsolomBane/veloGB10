@@ -448,8 +448,7 @@ impl FwdModel {
         let planes = self.pool_planes(slot)?;
         for &(at, rb, div, cap) in &planes {
             // pooled planes: one block of read-ahead, clamped to the lane's kernel extent (pool_planes IS the kernel geometry)
-            let units = if div > 1 { want.div_ceil(div) + 1 } else { want };
-            if let Err(e) = g.ensure(at, units.min(cap) * rb) {
+            if let Err(e) = g.ensure(at, plane_units(want, div, cap) * rb) {
                 // pool exhausted part-way: give back what this call mapped, so the lane is exactly as before (its
                 // counters still describe it; eviction and vmm_truncate see every page it holds)
                 let (r, p) = (self.vmm_rows[slot].load(Relaxed), self.vmm_pool_rows[slot].load(Relaxed));
@@ -517,10 +516,46 @@ impl FwdModel {
         self.vmm_pool_rows[slot].store(keep, Relaxed);
         for (at, rb, div, cap) in self.pool_planes(slot)? {
             // pooled planes keep the partial-group block too (see vmm_ensure); `cap` is the lane's kernel extent
-            let k = (if div > 1 { keep.div_ceil(div) + 1 } else { keep }).min(cap);
+            let k = plane_units(keep, div, cap);
             g.drop_range(at + (k * rb) as u64, (cap - k) * rb)?;
         }
         Ok(())
+    }
+    /// TPPOOL (design v3 step 4): how many pool pages `vmm_ensure(slot, rows)` would map right now. Dry run over the
+    /// same planes, grid and unit math as the real call (`plane_units`), counted as the union the real call's sequence
+    /// of `ensure`s maps. 0 = the fast path (or no lazy pool). Changes nothing.
+    pub fn vmm_pages_needed(&self, slot: usize, rows: usize) -> Result<usize> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(0) };
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(slot < self.width, "kv-vmm: slot {slot} >= width {}", self.width);
+        let want = crate::kv_vmm::rows_grid(rows + VMM_MARGIN_ROWS, self.max_pos);
+        if want <= self.vmm_rows[slot].load(Relaxed) { return Ok(0); }
+        let g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { return Ok(0); }
+        let ranges: Vec<(u64, usize)> = self.pool_planes(slot)?.into_iter()
+            .map(|(at, rb, div, cap)| (at, plane_units(want, div, cap) * rb)).collect();
+        g.pages_needed_union(&ranges)
+    }
+    /// TPPOOL (design v3 step 4): how many pool pages `vmm_truncate(slot, keep)` would return right now (only pages
+    /// wholly inside each dropped range, as `drop_range` frees them; a lane at its floor frees 0). Changes nothing.
+    pub fn vmm_pages_freed(&self, slot: usize, keep: usize) -> Result<usize> {
+        let Some(v) = self.vmm.as_ref() else { return Ok(0) };
+        use std::sync::atomic::Ordering::Relaxed;
+        let keep = crate::kv_vmm::rows_grid(keep.max(VMM_FLOOR_ROWS) + VMM_MARGIN_ROWS, self.max_pos);
+        if keep >= self.vmm_rows[slot].load(Relaxed) && keep >= self.vmm_pool_rows[slot].load(Relaxed) { return Ok(0); }
+        let g = v.lock().unwrap();
+        if g.mode() == crate::kv_vmm::Mode::Full { return Ok(0); }
+        let mut n = 0;
+        for (at, rb, div, cap) in self.pool_planes(slot)? {
+            let k = plane_units(keep, div, cap);
+            n += g.pages_freed(at + (k * rb) as u64, (cap - k) * rb)?;
+        }
+        Ok(n)
+    }
+    /// TPPOOL (design v3 step 4): unmapped pages left in the lazy pool (None = no lazy pool).
+    pub fn vmm_free_pages(&self) -> Option<usize> {
+        let g = self.vmm.as_ref()?.lock().unwrap();
+        (g.mode() == crate::kv_vmm::Mode::Lazy).then(|| g.free_pages())
     }
     /// KVPOOL: (pool bytes, mapped bytes, reserved bytes) — None when the pool is off.
     pub fn vmm_stats(&self) -> Option<(usize, usize, usize)> {

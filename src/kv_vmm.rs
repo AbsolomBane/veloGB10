@@ -87,6 +87,18 @@ pub fn count_pages(pages: &[u32], (p0, p1): (usize, usize), want_mapped: bool) -
     pages[p0..p1].iter().filter(|&&h| (h != 0) == want_mapped).count()
 }
 
+/// TPPOOL (design v3 step 4): unmapped pages in the UNION of several page spans (`(plane pages, (p0, p1))`). A page
+/// two spans share (same plane, same index) counts once. Pure, shared by `pages_needed_union` and its tests.
+pub fn count_union_unmapped(spans: &[(&[u32], (usize, usize))]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for &(pages, (p0, p1)) in spans {
+        for pg in p0..p1.min(pages.len()) {
+            if pages[pg] == 0 { seen.insert((pages.as_ptr() as usize, pg)); }
+        }
+    }
+    seen.len()
+}
+
 pub struct KvVmm {
     mode: Mode,
     dev_id: i32,
@@ -168,8 +180,6 @@ impl KvVmm {
         bail!("kv-vmm: range {at:#x}+{len} is not inside a reserved plane")
     }
 
-    /// Make every page under `[at, at+len)` mapped. Returns the pages newly mapped (0 = nothing to do).
-    /// Err (nothing half-done that matters: pages mapped so far stay mapped) when the pool is exhausted.
     /// KVPOOL (v2): how many pages `ensure(at, len)` would map right now (0 = nothing to do). Dry run: changes nothing.
     pub fn pages_needed(&self, at: u64, len: usize) -> Result<usize> {
         if len == 0 { return Ok(0); }
@@ -185,6 +195,20 @@ impl KvVmm {
         let base = self.planes[pi].base;
         Ok(count_pages(&self.planes[pi].pages, drop_page_bounds((at - base) as usize, len), true))
     }
+    /// TPPOOL (design v3 step 4): how many pages a SEQUENCE of `ensure` calls over `ranges` would map right now.
+    /// The union, not the sum: two neighbouring ranges (two planes of one lane, or two lanes) can share their
+    /// boundary page, which the first call maps and the second then finds mapped. Dry run: changes nothing.
+    pub fn pages_needed_union(&self, ranges: &[(u64, usize)]) -> Result<usize> {
+        let mut spans: Vec<(&[u32], (usize, usize))> = Vec::with_capacity(ranges.len());
+        for &(at, len) in ranges {
+            if len == 0 { continue; }
+            let pi = self.plane_of(at, len)?;
+            spans.push((&self.planes[pi].pages, ensure_page_bounds((at - self.planes[pi].base) as usize, len)));
+        }
+        Ok(count_union_unmapped(&spans))
+    }
+    /// Make every page under `[at, at+len)` mapped. Returns the pages newly mapped (0 = nothing to do).
+    /// Err (nothing half-done that matters: pages mapped so far stay mapped) when the pool is exhausted.
     pub fn ensure(&mut self, at: u64, len: usize) -> Result<usize> {
         if len == 0 { return Ok(0); }
         let pi = self.plane_of(at, len)?;
@@ -314,6 +338,27 @@ mod dry_run_tests {
         assert_eq!(drop_page_bounds(PAGE, 2 * PAGE), (1, 3));
         assert_eq!(drop_page_bounds(PAGE - 1, PAGE + 2), (1, 2));      // covers page 1 wholly
     }
+    #[test]
+    fn union_counts_a_shared_boundary_page_once_and_skips_mapped_pages() {
+        // plane A: pages 0..8, page 3 already mapped; plane B: an equal-looking but distinct plane
+        let mut a = vec![0u32; 8];
+        a[3] = 1;
+        let b = vec![0u32; 8];
+        // two ranges on A that share page 2 (one ends inside it, the next starts inside it)
+        let r1 = ensure_page_bounds(0, 2 * PAGE + 10);           // pages 0..3
+        let r2 = ensure_page_bounds(2 * PAGE + 20, 3 * PAGE);    // pages 2..6
+        assert_eq!(r1, (0, 3));
+        assert_eq!(r2, (2, 6));
+        // sum per range would be 3 + 3 = 6 (page 2 twice); the union is pages {0,1,2,4,5} = 5 (page 3 is mapped)
+        assert_eq!(count_pages(&a, r1, false) + count_pages(&a, r2, false), 6);
+        assert_eq!(count_union_unmapped(&[(&a, r1), (&a, r2)]), 5);
+        // the same page index on ANOTHER plane is another page
+        assert_eq!(count_union_unmapped(&[(&a, r1), (&b, r1)]), 6);
+        // empty and out-of-range spans add nothing
+        assert_eq!(count_union_unmapped(&[(&a, (4, 4)), (&a, (9, 12))]), 0);
+        assert_eq!(count_union_unmapped(&[]), 0);
+    }
+
     #[test]
     fn boundary_page_is_counted_once_in_a_union_not_per_lane() {
         // lane A: [0, PAGE+1) needs pages 0,1; lane B: [PAGE+1, 2*PAGE+5) needs pages 1,2 (page 1 is shared)

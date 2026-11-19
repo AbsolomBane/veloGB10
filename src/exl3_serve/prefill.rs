@@ -122,21 +122,7 @@ impl Exl3Scheduler {
     /// `keep`: lanes that must not be picked. Ok(false) = nothing to free. Single box only (TP ranks would have to agree).
     pub(super) fn vmm_evict_idle(&mut self, keep: &[usize]) -> Result<bool> {
         if !self.model.vmm_lazy() || self.tp.is_some() { return Ok(false); }
-        let base = crate::kv_vmm::rows_grid(crate::exl3_forward::VMM_FLOOR_ROWS + crate::exl3_forward::VMM_MARGIN_ROWS,
-                                            self.model.max_pos());
-        let pf = self.kv_pf.map(|p| p.0);
-        let mut idle: Vec<(usize, usize)> = (0..self.lanes.len())
-            .filter(|s| self.lanes[*s].is_none() && !keep.contains(s) && pf != Some(*s) && !self.pf_busy(*s))
-            .map(|s| (self.model.vmm_rows_mapped(s), s))
-            .filter(|x| x.0 > base)
-            .collect();
-        // PRIORITY (owner 2026-11-17): the longest idle session goes LAST. One long main conversation and short
-        // agent / sub-agent sessions share the pool; evicting the long one costs a multi-GB SSD round trip when its
-        // user comes back. So: smallest idle lane first, and the largest idle lane is kept while anything else
-        // idle can be freed. When it is the only idle lane left, it goes too (the alternative is failing a request).
-        idle.sort();
-        if idle.len() > 1 { idle.pop(); }
-        let Some(&(rows, v)) = idle.first() else { return Ok(false) };
+        let Some(&(rows, v)) = self.vmm_idle_victims(keep).first() else { return Ok(false) };
         let t0 = std::time::Instant::now();
         let cached = self.cache[v].take();
         if let Some(old) = cached.as_ref() {
@@ -153,6 +139,26 @@ impl Exl3Scheduler {
                           t0.elapsed().as_secs_f64());
         self.publish_kv();
         Ok(true)
+    }
+
+    /// KVPOOL: the idle lanes `vmm_evict_idle` may take, in the order it takes them: (rows mapped, slot). Read-only,
+    /// so TPPOOL's capacity gate (design v3 step 4) credits victims in exactly the eviction's order.
+    /// PRIORITY (owner 2026-11-17): the longest idle session goes LAST. One long main conversation and short
+    /// agent / sub-agent sessions share the pool; evicting the long one costs a multi-GB SSD round trip when its
+    /// user comes back. So: smallest idle lane first, and the largest idle lane is kept while anything else
+    /// idle can be freed. When it is the only idle lane left, it goes too (the alternative is failing a request).
+    pub(super) fn vmm_idle_victims(&self, keep: &[usize]) -> Vec<(usize, usize)> {
+        let base = crate::kv_vmm::rows_grid(crate::exl3_forward::VMM_FLOOR_ROWS + crate::exl3_forward::VMM_MARGIN_ROWS,
+                                            self.model.max_pos());
+        let pf = self.kv_pf.map(|p| p.0);
+        let mut idle: Vec<(usize, usize)> = (0..self.lanes.len())
+            .filter(|s| self.lanes[*s].is_none() && !keep.contains(s) && pf != Some(*s) && !self.pf_busy(*s))
+            .map(|s| (self.model.vmm_rows_mapped(s), s))
+            .filter(|x| x.0 > base)
+            .collect();
+        idle.sort();
+        if idle.len() > 1 { idle.pop(); }
+        idle
     }
 
     /// KVPOOL: make sure lane `slot` has its position rows `< rows` mapped, evicting idle lanes while the pool is full.

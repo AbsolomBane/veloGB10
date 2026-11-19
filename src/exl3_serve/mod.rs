@@ -40,6 +40,7 @@ mod serve;
 mod spec_program;
 mod step;
 mod tp_serve;
+mod tp_pool_gate; // TPPOOL (design v3 step 4): the head's capacity gate
 mod wp24_gate;
 
 use crate::batch::{BatchRequest, TokEvent};
@@ -915,6 +916,8 @@ mod df2_gate_tests;
 /// aborts its link either way. The shipped build failed this on every rank at the first TP=4 capture.
 #[cfg(test)]
 mod spill_agree_tests;
+#[cfg(test)]
+mod tp_pool_gate_tests;
 
 /// ISSUES 127 / 128 (static review P0s): source pins for the DF2 width clamp and the draft slot staging (the ISSUES 126
 /// ring re-alignment was measured and NOT kept: archive/reviewfix1-issue126-attempt). The behaviour needs a GPU; these keep a later edit from quietly restoring the old code.

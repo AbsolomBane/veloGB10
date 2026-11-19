@@ -109,6 +109,44 @@ impl Exl3Scheduler {
         self.publish_kv();
     }
 
+    /// The lane `admit_req` takes for `req`: the free lane whose snapshot is the longest prefix of this prompt,
+    /// then a lane with no snapshot, then any free lane (see `admit_req`). Read-only. `pending_free`: lanes that are
+    /// still occupied now but free by the time the admit applies (TPPOOL (design v3 step 4): a Cancel shipped in the
+    /// same step), so the head's capacity gate predicts the very lane the apply will pick; `admit_req` passes none.
+    pub(super) fn pick_lane(&self, req: &BatchRequest, scoped: Option<&[usize]>, pending_free: &[usize]) -> Option<usize> {
+        // PACKPF: a lane holding an in-flight packed prefill is not free for this admit
+        let free: Vec<usize> = (0..self.lanes.len())
+            .filter(|&i| (self.lanes[i].is_none() || pending_free.contains(&i)) && !self.pf_busy(i)).collect();
+        let free: Vec<usize> = match scoped {
+            Some(allowed) => free.into_iter().filter(|i| allowed.contains(i)).collect(),
+            None => free,
+        };
+        // PACKPF: the lane a packed prefill already filled with this prompt comes first
+        let packed = if scoped.is_none() {
+            free.iter().copied().find(|i| self.pf_done.get(i).map_or(false, |d| d.key == req.prompt))
+        } else { None };
+        let hit = free.iter().copied().filter_map(|i| match &self.cache[i] {
+            Some(t) if t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..] => Some((t.len(), i)),
+            _ => None,
+        }).max();
+        packed.or(hit.map(|(_, i)| i))
+            .or_else(|| {
+                // LANERES1: a scoped admit that did not come through the snapshot-hit arm
+                // picks its owner-change victim among the allowed lanes only.
+                if scoped.is_some() {
+                    return crate::lane_reserve::victim(&free, &self.slot_views(), &self.wp16_depths(&req.prompt));
+                }
+                // WP16: else the free lane whose checkpoints resume this prompt deepest
+                let st = self.wp16.as_ref()?;
+                let end = req.prompt.len().saturating_sub(1);
+                free.iter().copied()
+                    .map(|i| (st.resume_point(i, &req.prompt, end, self.chunk.max(1)).0, i))
+                    .filter(|&(q, _)| q > 0).max().map(|(_, i)| i)
+            })
+            .or_else(|| free.iter().copied().find(|&i| self.cache[i].is_none()))
+            .or_else(|| free.first().copied())
+    }
+
     fn admit_req(&mut self, mut req: BatchRequest, scoped: Option<(&[usize], crate::lane_reserve::Kind)>) {
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
@@ -117,38 +155,7 @@ impl Exl3Scheduler {
         // to the policy's `allowed` lanes, and the fallback after the snapshot hit is the
         // policy's victim order (empty > deepest WP16 > least recently released) instead of
         // "slot 0". `scoped == None` keeps today's pick byte-for-byte.
-        let pick = {
-            // PACKPF: a lane holding an in-flight packed prefill is not free for this admit
-            let free: Vec<usize> = (0..self.lanes.len()).filter(|&i| self.lanes[i].is_none() && !self.pf_busy(i)).collect();
-            let free: Vec<usize> = match scoped {
-                Some((allowed, _)) => free.into_iter().filter(|i| allowed.contains(i)).collect(),
-                None => free,
-            };
-            // PACKPF: the lane a packed prefill already filled with this prompt comes first
-            let packed = if scoped.is_none() {
-                free.iter().copied().find(|i| self.pf_done.get(i).map_or(false, |d| d.key == req.prompt))
-            } else { None };
-            let hit = free.iter().copied().filter_map(|i| match &self.cache[i] {
-                Some(t) if t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..] => Some((t.len(), i)),
-                _ => None,
-            }).max();
-            packed.or(hit.map(|(_, i)| i))
-                .or_else(|| {
-                    // LANERES1: a scoped admit that did not come through the snapshot-hit arm
-                    // picks its owner-change victim among the allowed lanes only.
-                    if scoped.is_some() {
-                        return crate::lane_reserve::victim(&free, &self.slot_views(), &self.wp16_depths(&req.prompt));
-                    }
-                    // WP16: else the free lane whose checkpoints resume this prompt deepest
-                    let st = self.wp16.as_ref()?;
-                    let end = req.prompt.len().saturating_sub(1);
-                    free.iter().copied()
-                        .map(|i| (st.resume_point(i, &req.prompt, end, self.chunk.max(1)).0, i))
-                        .filter(|&(q, _)| q > 0).max().map(|(_, i)| i)
-                })
-                .or_else(|| free.iter().copied().find(|&i| self.cache[i].is_none()))
-                .or_else(|| free.first().copied())
-        };
+        let pick = self.pick_lane(&req, scoped.as_ref().map(|s| s.0), &[]);
         let free = match pick {
             Some(i) => i,
             None => {
