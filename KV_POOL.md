@@ -8,6 +8,10 @@
 > The GPU figures were measured on the pool code before the TP commits. Those commits touch the one-box path only
 > through read-only refactors (the lane pick, the eviction order) and the group read-ahead exhaustion, and that part
 > is covered by CPU tests, not yet re-measured on the GPU.
+>
+> The branch starts with `feature/fit-floor-gb`, its first commit ([`8217aec`](https://github.com/AbsolomBane/veloGB10/commit/8217aec)): `--fit-floor-gb`, the boot plan's free-memory
+> floor as a registry flag (default 20 = upstream's fixed value). It is independent of the pool and useful on its own;
+> the pool recipe below uses `--fit-floor-gb 5`.
 
 This feature is developed with strong assistance from AI models: Claude (Anthropic) for design, code and tests, OpenAI Astra for independent cross-checks, and Qwen3.8-Flash-Next running locally on velo itself for heavy local analysis and testing, with a human architect (AbsolomBane) leading the design, the technical direction, the testing and the production use.
 Base: veloGB10 v0.7.10 by sf-stav (Apache-2.0) — this branch is the port of the `kv-pool` work from v0.7.9. Everything below is opt-in: without `--kv-pool` (default off) the engine behaves as v0.7.10.
