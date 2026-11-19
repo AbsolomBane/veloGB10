@@ -5,14 +5,11 @@
 # veloGB10
 
 > **Fork note (AbsolomBane/veloGB10):** this `main` is upstream [sf-stav/veloGB10](https://github.com/sf-stav/veloGB10)
-> v0.7.10 unchanged apart from this note. The fork adds an opt-in **shared KV pool across lanes** (many lanes share one
-> physical KV budget: a long 1M session plus agents on one GB10 (ASUS GX10)). Branches, all cut from v0.7.10:
-> - [`feature/kv-pool-0710`](https://github.com/AbsolomBane/veloGB10/tree/feature/kv-pool-0710): the pool on one box (design and tests in
->   [KV_POOL.md](https://github.com/AbsolomBane/veloGB10/blob/feature/kv-pool-0710/KV_POOL.md));
-> - [`feature/kv-pool-tp-0710`](https://github.com/AbsolomBane/veloGB10/tree/feature/kv-pool-tp-0710): the latest, the pool plus TP=2/4 groundwork (dormant: the
->   pool is still refused under TP);
-> - [`feature/fit-floor-gb`](https://github.com/AbsolomBane/veloGB10/tree/feature/fit-floor-gb): `--fit-floor-gb` on its own; **already included** in both branches
->   above (it is their first commit);
+> v0.7.10 unchanged apart from this note. Our work is in two branches, both cut from v0.7.10:
+> - [`feature/kv-pool-tp-0710`](https://github.com/AbsolomBane/veloGB10/tree/feature/kv-pool-tp-0710): an opt-in **shared KV pool across lanes** (many lanes share
+>   one physical KV budget: a long 1M session plus agents on one GB10 (ASUS GX10)), tested on one box (TP=1), plus
+>   **TP=2/4 groundwork that has never run on TP hardware** (the pool is still refused under TP). If you have a TP=2/4
+>   rig and want to help test it, see [KV_POOL.md](https://github.com/AbsolomBane/veloGB10/blob/feature/kv-pool-tp-0710/KV_POOL.md#tp24-help-wanted);
 > - [`feature/bench-tools`](https://github.com/AbsolomBane/veloGB10/tree/feature/bench-tools): benchmark scripts, no engine code.
 
 **A GB10-specific inference engine for one, two or four GB10-based systems — NVIDIA DGX Spark and
