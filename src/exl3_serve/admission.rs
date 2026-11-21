@@ -217,12 +217,16 @@ impl Exl3Scheduler {
                     let _ = self.model.clear_slot_vision(free);
                     if let Some(p) = self.psc.as_mut() { p.vis_img = None; p.vis_src.clear(); }
                     let msg = format!("{e:#}");
-                    let reason = if msg.starts_with("bad request:") || msg.starts_with("unprocessable:") {
+                    let client = msg.starts_with("bad request:") || msg.starts_with("unprocessable:");
+                    let reason = if client {
                         format!("error: {msg}")
                     } else {
                         format!("error: vision setup failed: {msg}") // an engine fault, not the client's
                     };
                     let _ = req.tx.send(TokEvent::Finish { reason });
+                    // A client error is decided from the shipped request alike on every rank (all ranks skip);
+                    // an engine fault (H2D / alloc in vision_setup) is rank-local.
+                    if !client && self.tp.is_some() { self.fatal = Some(msg); } // TP-D: never a one-rank skip
                     return;
                 }
             }
@@ -329,6 +333,7 @@ this line prints once per boot)"));
         };
         if let Err(e) = vstaged {
             let _ = req.tx.send(TokEvent::Finish { reason: format!("error: schema mask staging failed: {e}") });
+            if self.tp.is_some() { self.fatal = Some(format!("{e:#}")); } // TP-D: never a one-rank skip
             return;
         }
         let last = match self.model.forward_step(

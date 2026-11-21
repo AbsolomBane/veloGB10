@@ -870,6 +870,10 @@ mod stop_info_tests;
 #[cfg(test)]
 mod lane_pack_wiring_tests;
 
+/// TP-D: every staging / device failure in `admit_req` is fatal under TP (no one-rank lane skip). Source pins.
+#[cfg(test)]
+mod admit_tp_fatal_tests;
+
 /// S-B9-REL-SMALLFIXES 9a(iii) + 9a(iv): the scheduler side of the per-row attention regime.
 #[cfg(test)]
 mod regime_sched_tests;
