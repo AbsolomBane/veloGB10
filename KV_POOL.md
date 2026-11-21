@@ -227,3 +227,14 @@ servers; it does not change the speed comparison.
 | 31-minute Hermes agent run, 30 GB pool, 6 lanes busy (main + 4 parallel sub-agents) | 0 errors, no eviction needed |
 | Needle at 1M: 1,046,957 tokens, 6-digit code at 55%, greedy, 30 GB pool / 8 lanes | found; prefill 881 s (~1,189 tok/s); re-sent from prefix cache in 2.7 s, identical |
 | Diagnostics in lazy mode | refuse cleanly; unchanged with the pool off |
+
+## Scope & Support
+
+Hardware: GB10. Only. PRs for other GPUs welcome but not tested and not
+maintained here.
+
+Models: EXL3 quants. If a model panics velo and the cause is in the quant
+itself (fractional or mixed expert bitwidths, shards missing a module,
+tensor shapes that don't match the engine's lane stride), the issue
+belongs upstream with the EXL3 project or the quant's author — we'll help
+identify it, not patch around it.
