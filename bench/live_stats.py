@@ -38,17 +38,24 @@ def scrape():
 _steps = deque(maxlen=60)   # (t, scheduler_steps_total, requests_running) from native /metrics v0.7.3+
 _arm = deque(maxlen=60)    # (t, arm_tok_total, arm_ms_total) v0.7.5
 _ctx = {}
-_kv = deque(maxlen=60)     # (t, kv_positions_used, arm_tok) -> live prefill = KV grows without decode
+_kv = deque(maxlen=60)     # (monotonic time, used KV rows, decode tokens, running requests, restore hits)
 _pf = {}                   # last request: real prefill = (prompt - cached) / TTFT
-def prefill_live(window=6.0):
-    now = time.time(); r = [x for x in _kv if now - x[0] <= window]
-    if len(r) < 2 or r[-1][0] == r[0][0]: return None
-    # over consecutive pairs; jumps >8,000 tok/s are restored cache, not compute -> skipped
-    n = tm = 0.0
-    for a, b in zip(r, r[1:]):
-        dt = b[0] - a[0]; d = (b[1] - a[1]) - (b[2] - a[2])
-        if dt > 0 and 0 < d <= 8000 * dt: n += d; tm += dt
-    return n / tm if tm and n > 64 else None
+def prefill_live(window=12.0):
+    """Estimate wall-clock prefill speed from completed chunks within a stable window."""
+    now = time.monotonic()
+    samples = [sample for sample in _kv if now - sample[0] <= window]
+    tokens = elapsed = 0.0
+    for prev, curr in zip(samples, samples[1:]):
+        dt = curr[0] - prev[0]
+        decoded = curr[2] - prev[2]
+        new_rows = curr[1] - prev[1] - decoded
+        if dt <= 0 or curr[3] <= 0 or prev[3:] != curr[3:] or decoded < 0 or not (0 <= new_rows <= 8000 * dt):
+            tokens = elapsed = 0.0
+            continue
+        # KV positions update at chunk boundaries. Count the time between jumps, too.
+        tokens += new_rows
+        elapsed += dt
+    return tokens / elapsed if elapsed >= window / 2 and tokens > 64 else None
 def decode_arm(window=15.0):
     """(tok/s over the last seconds, cumulative tok/s) from the time actually spent decoding."""
     now = time.time(); r = [x for x in _arm if now - x[0] <= window]
@@ -75,7 +82,8 @@ def native():
         _arm.append((time.time(), tok, ms))
         _ctx.update(used=g("velogb10_kv_positions_used"), cap=g("velogb10_kv_positions_capacity"),
                     prompt=g("velogb10_prompt_tokens_total"), cached=g("velogb10_prompt_tokens_cached_total"))
-        _kv.append((time.time(), _ctx["used"], tok))
+        restore_hits = g("velogb10_prefix_pool_hits_total") + g("velogb10_kv_spill_hits_total")
+        _kv.append((time.monotonic(), _ctx["used"], tok, g("velogb10_requests_running"), restore_hits))
         tc, ts = g("velogb10_time_to_first_token_seconds_count"), g("velogb10_time_to_first_token_seconds_sum")
         u = (tc, ts, _ctx["prompt"], _ctx["cached"])
         if _pf.get("u") and tc > _pf["u"][0]:   # a new request reached its first token
@@ -226,8 +234,8 @@ def render(m, j, peak):
         pr = _ctx["prompt"] or 1
         L.append(dim(f"    context {_ctx['used']:,.0f} / {_ctx['cap']:,.0f}   prompt cache {_ctx['cached'] / pr * 100:.0f}% of {_ctx['prompt']:,.0f} tokens"))
     pv = prefill_live()
-    L.append(bold("  PREFILL") + dim("  (new tokens only, no cache)"))
-    L.append("    now      " + (cya(f"{pv:7.0f} tok/s") if pv else dim("      - tok/s")))
+    L.append(bold("  PREFILL") + dim("  (live estimate from KV progress over 12 s)"))
+    L.append("    live est " + (cya(f"{pv:7.0f} tok/s") if pv else dim("      - tok/s")))
     if _pf.get("last"):
         v, new, hit, dt, t = _pf["last"]
         L.append(f"    last     {v:,.0f} tok/s" + dim(f"   {new:,.0f} new + {hit:,.0f} from cache · TTFT {dt:.1f} s · {time.time() - t:.0f} s ago"))
@@ -266,6 +274,8 @@ def render(m, j, peak):
                  (dim(f"   SM {_gpu['clk']:.0f} MHz") if _gpu["clk"] is not None else ""))
     bz = kv_pool()
     if bz:
+        if u is not None:
+            L.append("")
         tok, cap, act, cac = bz
         L.append(bold("  KV POOL") + "   " + bar(tok / cap) + f" {tok / 1e6:5.2f}/{cap / 1e6:.2f}M tokens" +
                  dim(f"   active {act:,} + cache {cac:,}   (~18 KB/token, estimate)"))
