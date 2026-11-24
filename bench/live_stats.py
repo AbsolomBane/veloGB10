@@ -7,7 +7,7 @@
 #  * the engine log (--log, default: newest ~/logs/velo-*.log): last request, MTP acceptance,
 #  * nvidia-smi: GPU utilization, power, SM clock, temperature; /proc/meminfo: memory.
 #
-# The KV POOL bar appears only when the server runs with --kv-pool lazy --kv-pool-gb N (this fork).
+# The KV POOL bar uses native pool byte gauges on v0.8.0 and estimates occupancy on older builds.
 # Usage:  ./live_stats.py [--url http://127.0.0.1:18300] [--native http://127.0.0.1:18301] [--interval 1.0] [--log FILE] [--once]
 # Exit:   Ctrl+C
 import argparse, glob, os, re, shutil, subprocess, sys, time, urllib.request
@@ -80,8 +80,15 @@ def native():
         ms = sum(float(l.split()[1]) for l in t.splitlines() if l.startswith("velogb10_spec_lanes_arm_ms_total"))
         g = lambda k: next((float(l.split()[1]) for l in t.splitlines() if l.startswith(k + " ")), 0.0)
         _arm.append((time.time(), tok, ms))
-        _ctx.update(used=g("velogb10_kv_positions_used"), cap=g("velogb10_kv_positions_capacity"),
-                    prompt=g("velogb10_prompt_tokens_total"), cached=g("velogb10_prompt_tokens_cached_total"))
+        lane_used, lane_cap = max(
+            ((d.get(key.replace("_capacity{", "_used{"), 0), capacity)
+             for key, capacity in d.items() if key.startswith("velogb10_kv_lane_positions_capacity{")),
+            default=(0, 0),
+        )
+        _ctx.update(used=g("velogb10_kv_positions_used"), lane_used=lane_used, lane_cap=lane_cap,
+                    prompt=g("velogb10_prompt_tokens_total"), cached=g("velogb10_prompt_tokens_cached_total"),
+                    cached_positions=g("velogb10_kv_positions_cached"), pool_mode=d.get("velogb10_kv_vmm_mode"),
+                    pool_bytes=g("velogb10_kv_vmm_pool_bytes"), mapped_bytes=g("velogb10_kv_vmm_mapped_bytes"))
         restore_hits = g("velogb10_prefix_pool_hits_total") + g("velogb10_kv_spill_hits_total")
         _kv.append((time.monotonic(), _ctx["used"], tok, g("velogb10_requests_running"), restore_hits))
         tc, ts = g("velogb10_time_to_first_token_seconds_count"), g("velogb10_time_to_first_token_seconds_sum")
@@ -187,8 +194,11 @@ def temperatures():
 
 
 def kv_pool():
-    """Shared KV pool occupancy (this fork): active + cached positions from native /metrics, against the server's
-    --kv-pool-gb (measured: 20 GB ~ 1.04M tokens with q8 KV). None when the server runs without the pool."""
+    """Use measured pool bytes on v0.8.0 and estimated token occupancy on older builds."""
+    if _ctx.get("pool_mode") is not None:
+        if _ctx["pool_mode"] != 2 or _ctx["pool_bytes"] <= 0:
+            return None
+        return _ctx["mapped_bytes"], _ctx["pool_bytes"], _ctx["used"], _ctx["cached_positions"], "bytes"
     try:
         pid = subprocess.run(["pgrep", "-f", "gb10_inference --server"], capture_output=True, text=True).stdout.split()[0]
         argv = open(f"/proc/{pid}/cmdline").read().split("\0")
@@ -198,7 +208,7 @@ def kv_pool():
         t = urllib.request.urlopen(A.native + "/metrics", timeout=2).read().decode()
         g = lambda k: int(float(re.search(r"^" + k + r" ([0-9.e+]+)", t, re.M).group(1)))
         act, cac = g("velogb10_kv_positions_used"), g("velogb10_kv_positions_cached")
-        return act + cac, cap, act, cac
+        return act + cac, cap, act, cac, "tokens"
     except Exception: return None
 
 
@@ -230,9 +240,12 @@ def render(m, j, peak):
              dim("   peak ") + grn(f"{peak[0]:.1f}") + dim(f"   tok/round {j.tok_per_round:.2f}"))
     if al is not None and pl is None:
         L.append(dim(f"    pure decode from native counters (no prefill)   average since boot {ac or 0:.1f} tok/s"))
-    if _ctx.get("cap"):
-        pr = _ctx["prompt"] or 1
-        L.append(dim(f"    context {_ctx['used']:,.0f} / {_ctx['cap']:,.0f}   prompt cache {_ctx['cached'] / pr * 100:.0f}% of {_ctx['prompt']:,.0f} tokens"))
+    if "used" in _ctx:
+        if _ctx["lane_cap"]:
+            L.append(dim(f"    Largest lane {_ctx['lane_used']:,.0f} / {_ctx['lane_cap']:,.0f} tokens"))
+        L.append(dim(f"    Active KV total {_ctx['used']:,.0f} tokens"))
+        if pr := _ctx["prompt"]:
+            L.append(dim(f"    Prompt cache {_ctx['cached'] / pr * 100:.0f}% of {pr:,.0f} tokens since boot"))
     pv = prefill_live()
     L.append(bold("  PREFILL") + dim("  (live estimate from KV progress over 12 s)"))
     L.append("    live est " + (cya(f"{pv:7.0f} tok/s") if pv else dim("      - tok/s")))
@@ -276,9 +289,12 @@ def render(m, j, peak):
     if bz:
         if u is not None:
             L.append("")
-        tok, cap, act, cac = bz
-        L.append(bold("  KV POOL") + "   " + bar(tok / cap) + f" {tok / 1e6:5.2f}/{cap / 1e6:.2f}M tokens" +
-                 dim(f"   active {act:,} + cache {cac:,}   (~18 KB/token, estimate)"))
+        used, cap, act, cac, unit = bz
+        if unit == "bytes":
+            usage = f" {used / (1 << 30):.2f}/{cap / (1 << 30):.2f} GiB mapped"
+        else:
+            usage = f" {used / 1e6:.2f}/{cap / 1e6:.2f}M tokens (estimate)"
+        L.append(bold("  KV POOL") + "   " + bar(used / cap) + usage + dim(f"   active {act:,.0f} + cache {cac:,.0f}"))
     pz = os.path.expanduser("~/logs/velo-guard.log")
     if os.path.exists(pz) and os.path.getsize(pz):
         L.append("    " + red("memory guard stepped in: ") + open(pz).read().strip().splitlines()[-1])
