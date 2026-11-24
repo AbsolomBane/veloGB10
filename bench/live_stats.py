@@ -3,11 +3,11 @@
 #
 # Sources:
 #  * an OpenAI proxy's /metrics on --url (optional; without it the REQUESTS block shows a warning),
-#  * the engine's native /metrics on --nativ (v0.7.3+): decode, prefill, KV positions, shared KV pool,
+#  * the engine's native /metrics on --native (v0.7.3+): decode, prefill, KV positions, shared KV pool,
 #  * the engine log (--log, default: newest ~/logs/velo-*.log): last request, MTP acceptance,
 #  * nvidia-smi: GPU utilization, power, SM clock, temperature; /proc/meminfo: memory.
 #
-# The KV POOL bar appears only when the server runs with --kv-pool lazy --kv-pool-gb N (this fork).
+# The KV POOL bar uses the native pool byte gauges on v0.8.0 and estimates occupancy on older builds.
 # Usage:  ./live_stats.py [--url http://127.0.0.1:18300] [--native http://127.0.0.1:18301] [--interval 1.0] [--log FILE] [--once]
 # Exit:   Ctrl+C
 import argparse, glob, os, re, shutil, subprocess, sys, time, urllib.request
@@ -179,18 +179,27 @@ def temperatures():
 
 
 def kv_pool():
-    """Shared KV pool occupancy (this fork): active + cached positions from native /metrics, against the server's
-    --kv-pool-gb (measured: 20 GB ~ 1.04M tokens with q8 KV). None when the server runs without the pool."""
+    """Return actual pool bytes when available, or estimated token occupancy on older builds."""
     try:
+        body = urllib.request.urlopen(A.native + "/metrics", timeout=2).read().decode()
+        metrics = {key: float(value) for key, value in
+                   (line.split() for line in body.splitlines() if line.startswith("velogb10_kv_") and len(line.split()) == 2)}
+        mode = metrics.get("velogb10_kv_vmm_mode")
+        active = int(metrics.get("velogb10_kv_positions_used", 0))
+        cached = int(metrics.get("velogb10_kv_positions_cached", 0))
+        if mode is not None:
+            pool = metrics.get("velogb10_kv_vmm_pool_bytes", 0)
+            if mode != 2 or pool <= 0:
+                return None
+            mapped = metrics.get("velogb10_kv_vmm_mapped_bytes", 0)
+            return mapped, pool, active, cached, "bytes"
+
         pid = subprocess.run(["pgrep", "-f", "gb10_inference --server"], capture_output=True, text=True).stdout.split()[0]
         argv = open(f"/proc/{pid}/cmdline").read().split("\0")
         flag = lambda f: argv[argv.index(f) + 1] if f in argv and argv.index(f) + 1 < len(argv) else None
         if flag("--kv-pool") != "lazy" or not flag("--kv-pool-gb"): return None
         cap = float(flag("--kv-pool-gb")) * 1.04e6 / 20
-        t = urllib.request.urlopen(A.native + "/metrics", timeout=2).read().decode()
-        g = lambda k: int(float(re.search(r"^" + k + r" ([0-9.e+]+)", t, re.M).group(1)))
-        act, cac = g("velogb10_kv_positions_used"), g("velogb10_kv_positions_cached")
-        return act + cac, cap, act, cac
+        return active + cached, cap, active, cached, "tokens"
     except Exception: return None
 
 
@@ -266,9 +275,13 @@ def render(m, j, peak):
                  (dim(f"   SM {_gpu['clk']:.0f} MHz") if _gpu["clk"] is not None else ""))
     bz = kv_pool()
     if bz:
-        tok, cap, act, cac = bz
-        L.append(bold("  KV POOL") + "   " + bar(tok / cap) + f" {tok / 1e6:5.2f}/{cap / 1e6:.2f}M tokens" +
-                 dim(f"   active {act:,} + cache {cac:,}   (~18 KB/token, estimate)"))
+        used, cap, act, cac, unit = bz
+        if unit == "bytes":
+            usage = f" {used / (1 << 30):5.2f}/{cap / (1 << 30):.2f} GiB mapped"
+        else:
+            usage = f" {used / 1e6:5.2f}/{cap / 1e6:.2f}M tokens (estimate)"
+        L.append(bold("  KV POOL") + "   " + bar(used / cap) + usage +
+                 dim(f"   active {act:,} + cache {cac:,}"))
     pz = os.path.expanduser("~/logs/velo-guard.log")
     if os.path.exists(pz) and os.path.getsize(pz):
         L.append("    " + red("memory guard stepped in: ") + open(pz).read().strip().splitlines()[-1])

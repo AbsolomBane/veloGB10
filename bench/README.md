@@ -25,8 +25,8 @@ All scripts talk to an OpenAI-compatible endpoint. The defaults (`--url http://1
 * `decode_streams.py` uses temperature 0.6 (like a real chat); single runs vary by a few percent, more with MTP on
   prose. Repeat before drawing conclusions from small differences.
 * `live_stats.py` reads the engine's native `/metrics` (`--native`), the engine log (newest `~/logs/velo-*.log`,
-  or `--log`) and `nvidia-smi`. The KV POOL bar is an estimate from KV positions (~18 KB/token with q8 KV) and
-  appears only when the server runs with `--kv-pool lazy --kv-pool-gb N`. The REQUESTS block expects an
+  or `--log`) and `nvidia-smi`. On v0.8.0 the KV POOL bar shows mapped bytes for an active lazy pool.
+  On older builds it estimates occupancy from KV positions (~18 KB/token with q8 KV). The REQUESTS block expects an
   OpenAI proxy exposing `velo:*` counters on `--url`; without one it shows a warning and the rest still works.
 * Quality checks (perplexity, identical greedy outputs across configurations) were run with the engine's own tools
-  and are reported in KV_POOL.md.
+  and are reported in [the KV pool documentation](../docs/KV_POOL.md).
