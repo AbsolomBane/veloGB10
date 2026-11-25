@@ -654,9 +654,10 @@ impl FwdModel {
     /// PFXPOOL: bytes of one WP16 checkpoint on this rank (pool entries carry copies).
     pub fn ckpt_bytes(&self) -> u64 { self.ckpt_layout().bytes() as u64 }
 
-    /// Serialized file sizes without and with the WP16 checkpoints, before any copy or host allocation.
+    /// Serialized v6 file sizes `(base, full)` without and with the WP16 checkpoints,
+    /// computed before any device-to-host copy or host allocation.
     pub(crate) fn spill_capture_sizes(&self, slot: usize, tokens: usize,
-                                     cks: &[(u64, u64, &RecurCkpt)]) -> Result<(u64, u64)> {
+                                      cks: &[(u64, u64, &RecurCkpt)]) -> Result<(u64, u64)> {
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
         let regions = self.spill_regions(slot, tokens)?;
         let total = regions.iter().map(|(_, b)| *b).sum();
@@ -680,7 +681,7 @@ impl FwdModel {
     /// SPILLTRUNC: `ck_c` + `cks` (ascending (position, prefix_key, checkpoint)) are the lane's WP16 checkpoints
     /// for THIS conversation (Wp16::ckpts_under + kv_spill::prefix_keys); they ride the file in the section the
     /// payload format gained at version 6, so a later prompt that is a TRUNCATED prefix of `tokens` can resume at
-    /// a carried boundary (spill_trunc_restore) instead of eating a full re-prefill — the checkpoint bytes are a
+    /// a carried boundary (spill_trunc_restore) instead of eating a full re-prefill — the checkpoint bytes are
     /// sized from the checkpoint layout and D2H-copied through the same pinned staging as regions.
     /// Returns `fixed`: the file bytes that do NOT scale with rows (both headers + the state planes + hist + the
     /// checkpoint section) — kv_spill::Policy::trunc_read prices a truncated restore with it.
@@ -693,8 +694,8 @@ impl FwdModel {
         let checkpoint_bytes = cks.iter().map(|(_, _, ck)| ck.spill_bytes()).sum();
         let file_bytes = crate::kv_spill::capture_file_bytes(total, checkpoint_bytes, cks.len());
         out.clear();
-        // Reserve the full size in one allocation. Growing the Vec while adding checkpoints can
-        // transiently hold both the old and new allocations and overshoot the admission budget.
+        // Reserve the exact final size in one allocation so appending WP16 checkpoints never
+        // reallocates and transiently holds both old and new GiB-scale buffers in host RAM.
         out.try_reserve_exact(file_bytes).context("spill: reserve capture buffer")?;
         out.resize(72, 0); // LANERES3: outer 36B (kv_spill::finalize_header) + inner 36B
         // body header (GB10SPIL) that spill_restore parses — LANERES2 shipped the capture

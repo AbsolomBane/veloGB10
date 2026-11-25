@@ -68,6 +68,9 @@ pub fn trace_loop() {
 pub(crate) fn watchdog_floor_bytes() -> u64 {
     let floor_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok()
         .and_then(|v| v.parse().ok()).unwrap_or(5.0);
+    if !floor_gb.is_finite() || floor_gb <= 0.0 {
+        return 0;
+    }
     (floor_gb * 1e9) as u64
 }
 
