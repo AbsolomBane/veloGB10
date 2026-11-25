@@ -24,10 +24,10 @@ All scripts talk to an OpenAI-compatible endpoint. The defaults (`--url http://1
   loading the GPU. We report every run, including the slow ones.
 * `decode_streams.py` uses temperature 0.6 (like a real chat); single runs vary by a few percent, more with MTP on
   prose. Repeat before drawing conclusions from small differences.
-* `live_stats.py` reads the engine's native `/metrics` (`--native`), the engine log (newest `~/logs/velo-*.log`,
-  or `--log`) and `nvidia-smi`. The context line shows the largest active lane and its own limit when lane metrics
-  are available. The KV POOL bar uses mapped bytes on v0.8.0 and estimates token occupancy on older builds.
-  The REQUESTS block expects an
-  OpenAI proxy exposing `velo:*` counters on `--url`; without one it shows a warning and the rest still works.
+* `live_stats.py` reads native `/metrics` (`--native`), the engine log (newest `~/logs/velo-*.log` or `--log`),
+  and `nvidia-smi`. When lane metrics are available, each bar shows active context or dormant KV up to that
+  lane's limit. The KV POOL bar splits active and cached tokens against the estimated Ruby q8 capacity.
+  For a local engine with SSD spill enabled, KV SPILL SSD shows completed snapshot files and the configured limit
+  in GiB. Proxy metrics on `--url` provide fallback request counters.
 * Quality checks (perplexity, identical greedy outputs across configurations) were run with the engine's own tools
   and are reported in KV_POOL.md.

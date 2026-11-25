@@ -2,16 +2,18 @@
 # Live terminal monitor for a veloGB10 EXL3 server (written on an ASUS GX10 / GB10).
 #
 # Sources:
-#  * an OpenAI proxy's /metrics on --url (optional; without it the REQUESTS block shows a warning),
-#  * the engine's native /metrics on --nativ (v0.7.3+): decode, prefill, KV positions, shared KV pool,
+#  * an OpenAI proxy's /metrics on --url as a fallback for request counters,
+#  * the engine's native /metrics on --native (v0.7.3+): decode, prefill, KV positions, shared KV pool,
 #  * the engine log (--log, default: newest ~/logs/velo-*.log): last request, MTP acceptance,
 #  * nvidia-smi: GPU utilization, power, SM clock, temperature; /proc/meminfo: memory.
 #
-# The KV POOL bar uses native pool byte gauges on v0.8.0 and estimates occupancy on older builds.
+# The KV POOL capacity in tokens is estimated for Ruby q8. SSD spill occupancy comes from local snapshot files.
 # Usage:  ./live_stats.py [--url http://127.0.0.1:18300] [--native http://127.0.0.1:18301] [--interval 1.0] [--log FILE] [--once]
 # Exit:   Ctrl+C
 import argparse, glob, os, re, shutil, subprocess, sys, time, urllib.request
 from collections import deque
+from pathlib import Path
+from urllib.parse import urlsplit
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--url", default="http://127.0.0.1:18300")
@@ -68,6 +70,7 @@ def decode_arm(window=15.0):
 
 def native():
     """v0.7.3+: token counters update only at the end, but scheduler_steps_total is live."""
+    _ctx["running"] = None
     try:
         t = urllib.request.urlopen(A.native + "/metrics", timeout=2).read().decode()
         d = {l.split()[0]: float(l.split()[1]) for l in t.splitlines() if l.startswith("velogb10_") and len(l.split()) == 2}
@@ -80,15 +83,21 @@ def native():
         ms = sum(float(l.split()[1]) for l in t.splitlines() if l.startswith("velogb10_spec_lanes_arm_ms_total"))
         g = lambda k: next((float(l.split()[1]) for l in t.splitlines() if l.startswith(k + " ")), 0.0)
         _arm.append((time.time(), tok, ms))
-        lane_used, lane_cap = max(
-            ((d.get(key.replace("_capacity{", "_used{"), 0), capacity)
-             for key, capacity in d.items() if key.startswith("velogb10_kv_lane_positions_capacity{")),
-            default=(0, 0),
-        )
+        lanes = []
+        for key, capacity in d.items():
+            if lane := re.fullmatch(r'velogb10_kv_lane_positions_capacity\{lane="(\d+)"\}', key):
+                labels = key[key.index("{"):]
+                active = d.get("velogb10_kv_lane_positions_used" + labels, 0)
+                dormant = d.get("velogb10_kv_lane_positions_cached" + labels, 0)
+                lanes.append((int(lane[1]), active, dormant, capacity))
+        lane_used, lane_cap = max(((active, capacity) for _, active, _, capacity in lanes), default=(0, 0))
         _ctx.update(used=g("velogb10_kv_positions_used"), lane_used=lane_used, lane_cap=lane_cap,
+                    running=d.get("velogb10_requests_running"), lanes=sorted(lanes),
+                    finished=sum(value for key, value in d.items() if key.startswith("velogb10_requests_total{")),
+                    generated=g("velogb10_generation_tokens_total"),
                     prompt=g("velogb10_prompt_tokens_total"), cached=g("velogb10_prompt_tokens_cached_total"),
                     cached_positions=g("velogb10_kv_positions_cached"), pool_mode=d.get("velogb10_kv_vmm_mode"),
-                    pool_bytes=g("velogb10_kv_vmm_pool_bytes"), mapped_bytes=g("velogb10_kv_vmm_mapped_bytes"))
+                    pool_bytes=g("velogb10_kv_vmm_pool_bytes"))
         restore_hits = g("velogb10_prefix_pool_hits_total") + g("velogb10_kv_spill_hits_total")
         _kv.append((time.monotonic(), _ctx["used"], tok, g("velogb10_requests_running"), restore_hits))
         tc, ts = g("velogb10_time_to_first_token_seconds_count"), g("velogb10_time_to_first_token_seconds_sum")
@@ -117,6 +126,7 @@ def logfile():
 
 class EngineLog:
     """Reads only the new lines of the engine log."""
+    RE_TIMESTAMP = re.compile(r"^(\[[^\]]+\]) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
     RE_SPEC = re.compile(r"^\[spec-pass\] rounds (\d+)")
     RE_STREAM = re.compile(r"^\[req\] stream\s+prompt_tokens=(\d+)")
     RE_MTP = re.compile(r"^\[mtp-stats\].*?gen=(\d+).*?accepted=\d+ \(([\d.]+)%\) tok/round=([\d.]+) ms/round=([\d.]+)")
@@ -139,6 +149,7 @@ class EngineLog:
             f.seek(self.pos); linii = f.readlines(); self.pos = f.tell()
         now = time.time(); amorsare = not getattr(self, "amorsat", False); self.amorsat = True
         for l in linii:
+            l = self.RE_TIMESTAMP.sub(r"\1 ", l, count=1)
             if m := self.RE_SPEC.match(l):
                 if not amorsare: self.rounds_hist.append((now, int(m[1])))
             elif m := self.RE_STREAM.match(l): self.prompt, self.t_start = int(m[1]), (None if amorsare else now)
@@ -194,21 +205,23 @@ def temperatures():
 
 
 def kv_pool():
-    """Use measured pool bytes on v0.8.0 and estimated token occupancy on older builds."""
+    """Return active and cached positions against the estimated q8 KV pool capacity."""
+    tokens_per_gb = 52_000  # Ruby q8: about 1.04M positions for a 20 GB pool.
     if _ctx.get("pool_mode") is not None:
         if _ctx["pool_mode"] != 2 or _ctx["pool_bytes"] <= 0:
             return None
-        return _ctx["mapped_bytes"], _ctx["pool_bytes"], _ctx["used"], _ctx["cached_positions"], "bytes"
+        cap = _ctx["pool_bytes"] / 1e9 * tokens_per_gb
+        return cap, _ctx["used"], _ctx["cached_positions"]
     try:
         pid = subprocess.run(["pgrep", "-f", "gb10_inference --server"], capture_output=True, text=True).stdout.split()[0]
         argv = open(f"/proc/{pid}/cmdline").read().split("\0")
         flag = lambda f: argv[argv.index(f) + 1] if f in argv and argv.index(f) + 1 < len(argv) else None
         if flag("--kv-pool") != "lazy" or not flag("--kv-pool-gb"): return None
-        cap = float(flag("--kv-pool-gb")) * 1.04e6 / 20
+        cap = float(flag("--kv-pool-gb")) * tokens_per_gb
         t = urllib.request.urlopen(A.native + "/metrics", timeout=2).read().decode()
         g = lambda k: int(float(re.search(r"^" + k + r" ([0-9.e+]+)", t, re.M).group(1)))
         act, cac = g("velogb10_kv_positions_used"), g("velogb10_kv_positions_cached")
-        return act + cac, cap, act, cac, "tokens"
+        return cap, act, cac
     except Exception: return None
 
 
@@ -217,16 +230,107 @@ def bar(frac, w=22):
     return (red if frac >= 0.9 else grn)("█" * k) + dim("░" * (w - k))
 
 
+def spill_usage():
+    """Read the local head's completed spill files, without opening their payloads."""
+    endpoint = urlsplit(A.native)
+    if endpoint.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return None
+
+    def option(args, flag, default=None):
+        for index, arg in enumerate(args):
+            if arg == flag:
+                return args[index + 1] if index + 1 < len(args) else default
+            if arg.startswith(flag + "="):
+                return arg[len(flag) + 1:]
+        return default
+
+    port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+    pids = subprocess.run(["pgrep", "-x", "gb10_inference"], capture_output=True, text=True).stdout.split()
+    for pid in pids:
+        proc = Path("/proc") / pid
+        try:
+            args = (proc / "cmdline").read_bytes().decode(errors="replace").rstrip("\0").split("\0")
+            if "--server" not in args or option(args, "--port", "8000") != str(port):
+                continue
+            spill = option(args, "--kv-spill", "off")
+            limit = int(option(args, "--kv-spill-gb", "64")) << 30
+            if spill == "off" or limit <= 0:
+                return None
+            directory = Path("/tmp/gb10_kv_spill" if spill == "auto" else spill)
+            if not directory.is_absolute():
+                directory = (proc / "cwd").resolve() / directory
+            used = count = 0
+            with os.scandir(directory) as snapshots:
+                for snapshot in snapshots:
+                    if not re.fullmatch(r"conv[0-9a-f]{16}_rank0\.ksp", snapshot.name):
+                        continue
+                    try:
+                        if snapshot.is_file(follow_symlinks=False):
+                            used += snapshot.stat(follow_symlinks=False).st_size
+                            count += 1
+                    except FileNotFoundError:
+                        continue  # A restore or eviction can remove a snapshot during this scan.
+            return used, limit, count
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+_spill_sample = (float("-inf"), None)
+
+
+def live_spill_usage():
+    global _spill_sample
+    now = time.monotonic()
+    if now - _spill_sample[0] >= 5:
+        _spill_sample = (now, spill_usage())
+    return _spill_sample[1]
+
+
+def cache_green(s):
+    return c("38;2;0;110;55", s)
+
+
+def kv_pool_bar(active, cached, capacity, width=22):
+    scale = max(capacity, active + cached)
+    if scale <= 0:
+        return dim("░" * width)
+    active_cells = round(width * active / scale)
+    used_cells = round(width * (active + cached) / scale)
+    return (grn("█" * active_cells) + cache_green("█" * (used_cells - active_cells)) +
+            dim("░" * (width - used_cells)))
+
+
 def render(m, j, peak):
     L = [bold("  veloGB10 · Flash-Next EXL3") + dim(f"   {BASE}   ") + dim(time.strftime("%H:%M:%S")),
          dim("  kv-pool fork by AbsolomBane · https://github.com/AbsolomBane/veloGB10"), ""]
     alive = subprocess.run(["pgrep", "-f", "gb10_inference --server"], capture_output=True).returncode == 0
     L.append("  ENGINE   " + (grn("running") if alive else red("STOPPED")) + dim(f"   log {os.path.basename(j.path or '-')}"))
-    if m is None:
+    if (running := _ctx.get("running")) is not None:
+        lanes = _ctx["lanes"]
+        slots = f" / {len(lanes)}" if lanes else ""
+        L.append("  ACTIVE LANES " + bold(f"{running:.0f}{slots}") + dim(f"   finished {_ctx['finished']:,.0f}"))
+        L.append(dim(f"           prompt total {_ctx['prompt']:,.0f}   generated total {_ctx['generated']:,.0f}"))
+        for lane, active, dormant, capacity in lanes:
+            if active:
+                detail = grn(f"active context {active:,.0f}")
+            elif dormant:
+                detail = cache_green(f"KV dormant {dormant:,.0f}")
+            else:
+                detail = dim("empty")
+            L.append(f"    lane {lane:<2} {kv_pool_bar(active, dormant, capacity)}  {detail}" +
+                     dim(f" / {capacity:,.0f}"))
+        if spill := live_spill_usage():
+            used, limit, count = spill
+            L.append("")
+            L.append(bold("  KV SPILL SSD") + "   " + bar(used / limit) +
+                     f" {used / (1 << 30):.2f}/{limit / (1 << 30):.2f} GiB" +
+                     dim(f"   {count} snapshot{'s' if count != 1 else ''}"))
+    elif m is None:
         L.append("  " + red("the proxy does not answer /metrics (velo-proxy.py on :18300?)"))
     else:
         run = int(m.get("velo:num_requests_running", 0))
-        L.append("  REQUESTS running " + bold(str(run)) + dim(f"   max concurrent {int(m.get('velo:max_simultaneous', 0))}"
+        L.append("  REQUESTS running (proxy) " + bold(str(run)) + dim(
                  f"   finished {int(m.get('velo:request_success_total', 0))}"))
         L.append(dim(f"           prompt total {int(m.get('velo:prompt_tokens_total', 0)):,}   generated total {int(m.get('velo:generation_tokens_total', 0)):,}"))
     L.append("")
@@ -289,12 +393,11 @@ def render(m, j, peak):
     if bz:
         if u is not None:
             L.append("")
-        used, cap, act, cac, unit = bz
-        if unit == "bytes":
-            usage = f" {used / (1 << 30):.2f}/{cap / (1 << 30):.2f} GiB mapped"
-        else:
-            usage = f" {used / 1e6:.2f}/{cap / 1e6:.2f}M tokens (estimate)"
-        L.append(bold("  KV POOL") + "   " + bar(used / cap) + usage + dim(f"   active {act:,.0f} + cache {cac:,.0f}"))
+        cap, act, cac = bz
+        used = act + cac
+        usage = f" {used / 1e6:.2f}/{cap / 1e6:.2f}M tokens (est. cap)"
+        L.append(bold("  KV POOL") + "   " + kv_pool_bar(act, cac, cap) + usage)
+        L.append("           " + grn(f"active {act:,.0f}") + " + " + cache_green(f"cache {cac:,.0f}"))
     pz = os.path.expanduser("~/logs/velo-guard.log")
     if os.path.exists(pz) and os.path.getsize(pz):
         L.append("    " + red("memory guard stepped in: ") + open(pz).read().strip().splitlines()[-1])
