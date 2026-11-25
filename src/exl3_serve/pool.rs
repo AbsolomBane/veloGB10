@@ -449,13 +449,13 @@ impl Exl3Scheduler {
         // the outcome is agreed across ranks with one SpillFlag: a disk or capture failure
         // on ANY rank drops the key EVERYWHERE (counted), so the replicated policy can
         // never diverge.
-        let est = tokens * crate::kv_spill::KV_BYTES_PER_TOKEN;
-        if !self.spill_pol.would_admit(key, est, tokens) {
-            crate::metrics::kv_spill_miss_recompute();
-            crate::drprintln!("[kv-spill] capture refused before D2H: {tokens} tokens (est {} MiB) would exceed cap or displace deeper snapshots", est >> 20);
-            return Ok(());
-        }
         if self.tp.is_some() {
+            let est = tokens * crate::kv_spill::KV_BYTES_PER_TOKEN;
+            if !self.spill_pol.would_admit(key, est, tokens) {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[kv-spill] capture refused before D2H: {tokens} tokens (est {} MiB) would exceed cap or displace deeper snapshots", est >> 20);
+                return Ok(());
+            }
             let mut buf = Vec::new();
             let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, &cks) {
                 Ok(f) => f,
@@ -505,19 +505,31 @@ impl Exl3Scheduler {
             crate::metrics::kv_spill_write(bytes, tokens);
             return Ok(());
         }
-        // Pre-check the queue budget BEFORE the GiB-scale capture exists: a refusal here is
-        // free; one after the D2H transiently pumps ~4 GB through malloc and can cross the
-        // box's memwatch floor under churn (the b5x10 lesson).
-        {
-            let st = self.spill.as_ref().unwrap();
-            if st.pending.load(std::sync::atomic::Ordering::Relaxed) + est > st.max_pending {
-                crate::drprintln!("[kv-spill] capture refused: queue over budget (est {est} bytes)");
+        let (base, full) = match self.model.spill_capture_sizes(slot, old.len(), &cks) {
+            Ok(sizes) => sizes,
+            Err(e) => {
                 crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[kv-spill] capture size unavailable slot={slot} ({e:#})");
                 return Ok(());
             }
-        }
+        };
+        let pending = st.pending.load(std::sync::atomic::Ordering::Relaxed);
+        let available = crate::memwatch::mem_available_bytes().unwrap_or(0);
+        let budget = crate::kv_spill::capture_byte_budget(
+            pending, st.max_pending, available, crate::memwatch::watchdog_floor_bytes());
+        let fits = |bytes| bytes <= budget && self.spill_pol.would_admit(key, bytes, tokens);
+        let (c0, cks) = if fits(full) {
+            (c0, cks.as_slice())
+        } else if full != base && fits(base) {
+            crate::drprintln!("[kv-spill] capture without WP16: tokens={tokens} full={full} base={base} budget={budget} pending={pending} available={available}");
+            (0, &[][..])
+        } else {
+            crate::drprintln!("[kv-spill] capture refused before D2H: tokens={tokens} full={full} base={base} budget={budget} pending={pending} available={available}");
+            crate::metrics::kv_spill_miss_recompute();
+            return Ok(());
+        };
         let mut buf = Vec::new();
-        let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, &cks) {
+        let fixed = match self.model.spill_capture(slot, old.len(), &mut buf, c0 as u32, cks) {
             Ok(f) => f,
             Err(e) => {
                 crate::metrics::kv_spill_miss_recompute();

@@ -112,6 +112,25 @@ pub const SPILL_PAYLOAD_VERSION: u32 = 6;
 pub const CK_TABLE_ENTRY_BYTES: u64 = 8 + 8 + 8;
 /// Bytes of the checkpoint section trailer before the table: nck u32 + ck_c u32 + fixed u64.
 pub const CK_TRAILER_BYTES: u64 = 4 + 4 + 8;
+/// Host staging used one chunk at a time for the device-to-host copy.
+pub(crate) const CAPTURE_CHUNK_BYTES: usize = 64 << 20;
+/// Leave room above the watchdog for sampling, page cache writeback and concurrent host allocations.
+const CAPTURE_HEADROOM_BYTES: u64 = 512 << 20;
+
+/// Serialized v6 file length, including both headers, PLE history and the checkpoint section.
+pub(crate) fn capture_file_bytes(region_bytes: usize, checkpoint_bytes: usize, checkpoints: usize) -> usize {
+    HEADER_LEN as usize + 36 + region_bytes + 8 + CK_TRAILER_BYTES as usize
+        + checkpoint_bytes + checkpoints * CK_TABLE_ENTRY_BYTES as usize
+}
+
+/// The smaller of queue room and host room. Pending buffers are already reflected in MemAvailable.
+pub(crate) fn capture_byte_budget(pending: u64, max_pending: u64, available: u64, watchdog_floor: u64) -> u64 {
+    max_pending.saturating_sub(pending).min(
+        available.saturating_sub(watchdog_floor)
+            .saturating_sub(CAPTURE_HEADROOM_BYTES)
+            .saturating_sub(CAPTURE_CHUNK_BYTES as u64)
+    )
+}
 
 /// FNV-1a 64: payload integrity without pulling in a crate (std-only module).
 fn fnv1a64(data: &[u8]) -> u64 {
